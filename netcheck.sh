@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================
 #  netcheck.sh – Netzwerk & WLAN Diagnose für macOS und Linux
-#  v2.1 – Fix: set -e entfernt, detect_connection_type robuster,
-#         Hotspot-Erkennung, lautlose Abbrüche behoben
+#  v2.2 – Logfile auf Desktop/Schreibtisch
 #  Autor: github.com/Onslaught2508/netcheck
 #  Lizenz: MIT
 # ============================================================
 
-# KEIN set -e: verhindert lautlose Abbrüche bei Nicht-Null-Exits
 set -uo pipefail
 
 # ── Farben ───────────────────────────────────────────────────
@@ -22,10 +20,8 @@ warn()   { echo -e "  ${YELLOW}⚠${RESET}  $1"; }
 fail()   { echo -e "  ${RED}✘${RESET}  $1"; }
 info()   { echo -e "  ${CYAN}ℹ${RESET}  $1"; }
 
-# macOS: date kennt kein %3N → python3
 now_ms() { python3 -c "import time; print(int(time.time() * 1000))" 2>/dev/null || echo "0"; }
 
-# iperf3 mit hartem Timeout via Background-Job
 iperf3_with_timeout() {
   local host="$1" port="$2" duration="${3:-5}" timeout_sec="${4:-15}"
   local tmpfile
@@ -56,7 +52,6 @@ detect_platform() {
 }
 
 # ── Verbindungsart erkennen ───────────────────────────────────
-# Setzt: HAS_WIFI, HAS_ETHERNET, WIFI_IF, ETH_IF, IS_HOTSPOT
 detect_connection_type() {
   HAS_WIFI=false
   HAS_ETHERNET=false
@@ -65,22 +60,18 @@ detect_connection_type() {
   ETH_IF=""
 
   if [[ "$OS" == "macos" ]]; then
-    # Alle Interfaces mit IP holen (sicher, kein read-in-loop)
     local all_ifs
     all_ifs=$(ifconfig 2>/dev/null | awk '/^[a-z]/{iface=$1} /inet [0-9]/{print iface, $2}' \
               | grep -v '127\.0\.0\.1' | grep -v '169\.254\.' || true)
 
-    # WLAN-Interface via airport oder system_profiler
     local wifi_candidate=""
     wifi_candidate=$(networksetup -listallhardwareports 2>/dev/null \
       | awk '/Wi-Fi|AirPort/{found=1} found && /Device:/{print $2; exit}' || true)
 
     if [[ -n "$wifi_candidate" ]]; then
-      # Hat dieses Interface eine IP?
       if echo "$all_ifs" | grep -q "^${wifi_candidate}:"; then
         HAS_WIFI=true
         WIFI_IF="$wifi_candidate"
-        # Hotspot-Erkennung: 172.20.10.x ist iOS Personal Hotspot
         local wifi_ip
         wifi_ip=$(echo "$all_ifs" | awk "/^${wifi_candidate}:/{print \$2}")
         if echo "$wifi_ip" | grep -qE '^172\.20\.10\.'; then
@@ -89,7 +80,6 @@ detect_connection_type() {
       fi
     fi
 
-    # Ethernet-Interface
     local eth_candidate=""
     eth_candidate=$(networksetup -listallhardwareports 2>/dev/null \
       | awk '/Ethernet|Thunderbolt/{found=1} found && /Device:/{print $2; found=0}' \
@@ -128,14 +118,12 @@ check_deps() {
       warn "Xcode Command Line Tools fehlen – werden installiert..."
       xcode-select --install 2>/dev/null || true
     fi
-
     if command -v brew &>/dev/null; then
       ok "Homebrew vorhanden ($(brew --version 2>/dev/null | head -1))"
     else
       warn "Homebrew nicht gefunden – wird installiert..."
       /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
     fi
-
     if command -v iperf3 &>/dev/null; then
       ok "iperf3 vorhanden ($(iperf3 --version 2>/dev/null | head -1))"
     else
@@ -168,7 +156,6 @@ check_deps() {
   else
     warn "traceroute/tracepath nicht gefunden"
   fi
-
   ok "Alle Abhängigkeiten geprüft"
 }
 
@@ -180,21 +167,18 @@ system_info() {
   if [[ "$OS" == "macos" ]]; then
     info "macOS:       $(sw_vers -productVersion 2>/dev/null) ($(sw_vers -buildVersion 2>/dev/null))"
   elif [[ "$OS" == "linux" ]]; then
-    if [[ -f /etc/os-release ]]; then
-      # shellcheck disable=SC1091
-      info "OS:          $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unbekannt}")"
-    fi
+    [[ -f /etc/os-release ]] && info "OS:          $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unbekannt}")"
     info "Kernel:      $(uname -r)"
   fi
   info "Datum/Zeit:  $(date '+%Y-%m-%d %H:%M:%S')"
   info "Nutzer:      $(whoami)"
+  info "Logfile:     ${LOGFILE}"
 }
 
 # ── Netzwerk-Interfaces ───────────────────────────────────────
 network_interfaces() {
   header "🔌 Netzwerk-Interfaces"
 
-  # Verbindungsart-Zusammenfassung
   if $HAS_WIFI && $HAS_ETHERNET; then
     warn "WLAN und Ethernet gleichzeitig aktiv – Routing-Priorität beachten"
   elif $HAS_WIFI && $IS_HOTSPOT; then
@@ -208,7 +192,6 @@ network_interfaces() {
   fi
 
   echo ""
-
   if [[ "$OS" == "macos" ]]; then
     ifconfig 2>/dev/null | awk '
       /^[a-z]/ { iface=$1 }
@@ -247,8 +230,8 @@ wlan_info() {
   if $IS_HOTSPOT; then
     header "📶 WLAN – Mobiler Hotspot (${WIFI_IF})"
     warn "Verbindung über mobilen Hotspot erkannt (172.20.10.x)"
-    info "WLAN-Kanalanalyse nicht aussagekräftig – Hotspot-Frequenz vom Mobilgerät bestimmt"
-    info "Bandbreite durch Mobilfunknetz begrenzt – iperf3-Ergebnisse entsprechend einordnen"
+    info "WLAN-Kanalanalyse nicht aussagekräftig – Frequenz vom Mobilgerät bestimmt"
+    info "Bandbreite durch Mobilfunknetz begrenzt"
   else
     header "📶 WLAN – Aktuelles Netzwerk (${WIFI_IF})"
   fi
@@ -256,7 +239,6 @@ wlan_info() {
   if [[ "$OS" == "macos" ]]; then
     local wlan_raw=""
     wlan_raw=$(system_profiler SPAirPortDataType 2>/dev/null || true)
-
     local current=""
     current=$(echo "$wlan_raw" | awk '
       /Current Network Information:/{found=1; count=0}
@@ -305,7 +287,6 @@ wlan_info() {
       fi
     done <<< "$current"
 
-    # Kanal-Umgebung nur bei echtem WLAN sinnvoll
     if ! $IS_HOTSPOT; then
       header "📡 WLAN-Umgebung (Kanal-Belegung)"
       echo "$wlan_raw" | grep "Channel:" | grep -oE '[0-9]+ \([^)]+\)' \
@@ -330,10 +311,8 @@ wlan_info() {
       freq=$(echo "$iw_out"    | awk '/freq:/{print $2}')
       signal=$(echo "$iw_out"  | awk '/signal:/{print $2, $3}')
       bitrate=$(echo "$iw_out" | awk '/tx bitrate:/{print $3, $4}')
-
       info "SSID:      ${ssid:-unbekannt}"
       info "Bitrate:   ${bitrate:-unbekannt}"
-
       if [[ -n "$freq" ]]; then
         local freq_int=${freq%.*}
         if [[ $freq_int -ge 5000 ]]; then
@@ -342,7 +321,6 @@ wlan_info() {
           warn "Frequenz: ${freq} MHz  ← 2,4 GHz: Interferenzrisiko!"
         fi
       fi
-
       if [[ -n "$signal" ]]; then
         local rssi
         rssi=$(echo "$signal" | awk '{print $1}')
@@ -355,7 +333,7 @@ wlan_info() {
         fi
       fi
     else
-      warn "iw nicht gefunden – WLAN-Details nicht verfügbar (sudo apt install iw)"
+      warn "iw nicht gefunden (sudo apt install iw)"
     fi
   fi
 }
@@ -387,10 +365,7 @@ ethernet_info() {
 # ── Latenz-Test ───────────────────────────────────────────────
 latency_check() {
   header "⏱  Latenz-Test"
-  if $IS_HOTSPOT; then
-    warn "Hotspot aktiv – Latenz durch Mobilfunknetz beeinflusst"
-  fi
-
+  $IS_HOTSPOT && warn "Hotspot aktiv – Latenz durch Mobilfunknetz beeinflusst"
   local targets=("8.8.8.8:Google DNS" "1.1.1.1:Cloudflare DNS" "9.9.9.9:Quad9 DNS")
   for entry in "${targets[@]}"; do
     local host="${entry%%:*}" name="${entry##*:}"
@@ -419,12 +394,9 @@ dns_check() {
     ip=$(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]+\.' | head -1 || true)
     end=$(now_ms); ms=$((end - start))
     if [[ -n "$ip" ]]; then
-      if [[ $ms -lt 50 ]]; then
-        ok "$domain → $ip  (${ms} ms)"
-      elif [[ $ms -lt 150 ]]; then
-        warn "$domain → $ip  (${ms} ms)  ← etwas langsam"
-      else
-        fail "$domain → $ip  (${ms} ms)  ← langsam"
+      if   [[ $ms -lt 50  ]]; then ok   "$domain → $ip  (${ms} ms)"
+      elif [[ $ms -lt 150 ]]; then warn "$domain → $ip  (${ms} ms)  ← etwas langsam"
+      else                         fail "$domain → $ip  (${ms} ms)  ← langsam"
       fi
     else
       fail "$domain → nicht auflösbar"
@@ -435,9 +407,7 @@ dns_check() {
 # ── Traceroute ────────────────────────────────────────────────
 traceroute_check() {
   header "🗺  Traceroute (max. 15 Hops)"
-  if $IS_HOTSPOT; then
-    info "Hinweis: Hotspot-Gateways blockieren oft ICMP → viele * * * normal"
-  fi
+  $IS_HOTSPOT && info "Hinweis: Hotspot-Gateways blockieren oft ICMP → viele * * * normal"
   if command -v traceroute &>/dev/null; then
     traceroute -m 15 -w 2 8.8.8.8 2>/dev/null | head -20 || true
   elif command -v tracepath &>/dev/null; then
@@ -450,17 +420,12 @@ traceroute_check() {
 # ── Bandbreite ────────────────────────────────────────────────
 bandwidth_check() {
   header "🚀 Bandbreiten-Test (iperf3)"
-
   if ! command -v iperf3 &>/dev/null; then
     warn "iperf3 nicht verfügbar – Test übersprungen"
     info "Alternativ: https://fast.com oder https://speedtest.net"
     return
   fi
-
-  if $IS_HOTSPOT; then
-    warn "Hotspot aktiv – Bandbreite durch Mobilfunk begrenzt, Ergebnisse entsprechend einordnen"
-  fi
-
+  $IS_HOTSPOT && warn "Hotspot aktiv – Bandbreite durch Mobilfunk begrenzt"
   warn "Hinweis: Testet TCP-Durchsatz zu öffentlichen iperf3-Servern"
   warn "Strategie: Fallback-Liste – erster erreichbarer Server gewinnt"
 
@@ -513,16 +478,11 @@ bandwidth_check() {
 summary() {
   header "📋 Zusammenfassung"
   local conn_type
-  if $HAS_WIFI && $HAS_ETHERNET; then
-    conn_type="WLAN + Ethernet"
-  elif $HAS_WIFI && $IS_HOTSPOT; then
-    conn_type="Mobiler Hotspot (${WIFI_IF})"
-  elif $HAS_WIFI; then
-    conn_type="WLAN (${WIFI_IF})"
-  elif $HAS_ETHERNET; then
-    conn_type="Ethernet (${ETH_IF})"
-  else
-    conn_type="keine aktive Verbindung"
+  if $HAS_WIFI && $HAS_ETHERNET; then   conn_type="WLAN + Ethernet"
+  elif $HAS_WIFI && $IS_HOTSPOT; then   conn_type="Mobiler Hotspot (${WIFI_IF})"
+  elif $HAS_WIFI; then                  conn_type="WLAN (${WIFI_IF})"
+  elif $HAS_ETHERNET; then              conn_type="Ethernet (${ETH_IF})"
+  else                                  conn_type="keine aktive Verbindung"
   fi
   echo -e "  Diagnose abgeschlossen: $(date '+%H:%M:%S')"
   echo -e "  Plattform:    $OS"
@@ -537,7 +497,12 @@ summary() {
 }
 
 # ── Hauptprogramm ─────────────────────────────────────────────
-LOGFILE="/tmp/netcheck_$(date +%Y%m%d_%H%M%S).log"
+
+# Desktop-Pfad: macOS deutsch = Schreibtisch, macOS englisch = Desktop, Linux = Desktop
+DESKTOP="${HOME}/Desktop"
+[[ -d "${HOME}/Schreibtisch" ]] && DESKTOP="${HOME}/Schreibtisch"
+LOGFILE="${DESKTOP}/netcheck_$(date +%Y%m%d_%H%M%S).log"
+
 exec > >(tee -a "$LOGFILE") 2>&1
 
 echo -e "${BOLD}${CYAN}"
@@ -548,7 +513,7 @@ echo "  ██║╚██╗██║██╔══╝     ██║   ██�
 echo "  ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗"
 echo "  ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝"
 echo -e "${RESET}"
-echo -e "  ${CYAN}macOS/Linux Netzwerk-Diagnose v2.1${RESET} | $(date '+%Y-%m-%d %H:%M')"
+echo -e "  ${CYAN}macOS/Linux Netzwerk-Diagnose v2.2${RESET} | $(date '+%Y-%m-%d %H:%M')"
 echo ""
 
 detect_platform
