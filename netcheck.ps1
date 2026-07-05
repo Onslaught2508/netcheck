@@ -1,6 +1,6 @@
 # ============================================================
 #  netcheck.ps1 – Netzwerk & WLAN Diagnose für Windows
-#  v2.1 – Logfile auf Desktop (inkl. OneDrive-Umleitung)
+#  v2.2 – Fix: LinkSpeed String-Parsing ("1 Gbps" / "100 Mbps")
 #  Autor: github.com/Onslaught2508/netcheck
 #  Lizenz: MIT
 #  Ausführung: powershell -ExecutionPolicy Bypass -File netcheck.ps1
@@ -24,6 +24,28 @@ function Get-WlanField([string[]]$lines, [string]$pattern) {
     return ""
 }
 
+# LinkSpeed robust parsen – Get-NetAdapter liefert je nach Windows-Version
+# entweder einen Long (Bits/s) oder einen formatierten String ("1 Gbps", "100 Mbps")
+function Get-LinkSpeedMbit($adapter) {
+    $raw = $adapter.LinkSpeed
+    # Wenn numerisch: direkt umrechnen
+    if ($raw -is [long] -or $raw -is [int] -or $raw -is [uint64]) {
+        return [math]::Round($raw / 1MB, 0)
+    }
+    # Wenn String: parsen
+    $str = "$raw".Trim()
+    if ($str -match '([\d.]+)\s*(G|Gbps|Gbit)') {
+        return [math]::Round([double]$Matches[1] * 1000, 0)
+    }
+    if ($str -match '([\d.]+)\s*(M|Mbps|Mbit)') {
+        return [math]::Round([double]$Matches[1], 0)
+    }
+    if ($str -match '([\d.]+)\s*(K|Kbps|Kbit)') {
+        return [math]::Round([double]$Matches[1] / 1000, 0)
+    }
+    return $null
+}
+
 # Desktop-Pfad – robust gegen OneDrive-Umleitung
 $Desktop = [System.Environment]::GetFolderPath('Desktop')
 $LogFile = "$Desktop\netcheck_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
@@ -38,7 +60,7 @@ Write-Host @"
   ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗
   ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝
 "@ -ForegroundColor Cyan
-Write-Host "  Windows Netzwerk-Diagnose v2.1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
+Write-Host "  Windows Netzwerk-Diagnose v2.2 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
 Write-Host ""
 
 # ── Verbindungsart erkennen ────────────────────────────────────
@@ -69,7 +91,6 @@ function Detect-ConnectionType {
         if ($isWifi) {
             $script:HasWifi     = $true
             $script:WifiAdapter = $a
-            # Hotspot-Erkennung: 172.20.10.x = iOS Personal Hotspot
             $wifiIP = (Get-NetIPAddress -InterfaceIndex $a.InterfaceIndex `
                          -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
             if ($wifiIP -like '172.20.10.*') { $script:IsHotspot = $true }
@@ -237,14 +258,20 @@ function Get-EthernetInfo {
     $a = $script:EthAdapter
     Write-Info "Adapter:       $($a.Name)"
     Write-Info "Beschreibung:  $($a.InterfaceDescription)"
-    $speedMbit = [math]::Round($a.LinkSpeed / 1MB, 0)
-    if ($a.LinkSpeed -ge 1GB) {
-        Write-Ok  "Geschwindigkeit: $([math]::Round($a.LinkSpeed / 1GB, 0)) Gbit/s  ← optimal"
+
+    # LinkSpeed robust parsen – kann Long (Bits/s) oder String ("1 Gbps") sein
+    $speedMbit = Get-LinkSpeedMbit $a
+
+    if ($null -eq $speedMbit) {
+        Write-Info "Geschwindigkeit: $($a.LinkSpeed)  (nicht parsebar)"
+    } elseif ($speedMbit -ge 1000) {
+        Write-Ok  "Geschwindigkeit: $([math]::Round($speedMbit / 1000, 0)) Gbit/s  ← optimal"
     } elseif ($speedMbit -ge 100) {
         Write-Ok  "Geschwindigkeit: ${speedMbit} Mbit/s"
     } else {
         Write-Warn "Geschwindigkeit: ${speedMbit} Mbit/s  ← langsam"
     }
+
     Write-Info "MAC:           $($a.MacAddress)"
 }
 
@@ -370,11 +397,11 @@ function Test-Bandwidth {
 # ── Zusammenfassung ────────────────────────────────────────────
 function Write-Summary {
     Write-Header "📋 Zusammenfassung"
-    $connType = if ($script:HasWifi -and $script:HasEthernet) { "WLAN + Ethernet" }
-                elseif ($script:HasWifi -and $script:IsHotspot) { "Mobiler Hotspot ($($script:WifiAdapter.Name))" }
-                elseif ($script:HasWifi)     { "WLAN ($($script:WifiAdapter.Name))" }
-                elseif ($script:HasEthernet) { "Ethernet ($($script:EthAdapter.Name))" }
-                else                         { "keine aktive Verbindung" }
+    $connType = if ($script:HasWifi -and $script:HasEthernet)    { "WLAN + Ethernet" }
+                elseif ($script:HasWifi -and $script:IsHotspot)  { "Mobiler Hotspot ($($script:WifiAdapter.Name))" }
+                elseif ($script:HasWifi)                         { "WLAN ($($script:WifiAdapter.Name))" }
+                elseif ($script:HasEthernet)                     { "Ethernet ($($script:EthAdapter.Name))" }
+                else                                             { "keine aktive Verbindung" }
     Write-Host "  Diagnose abgeschlossen: $(Get-Date -Format 'HH:mm:ss')"
     Write-Host "  Verbindungsart: $connType"
     Write-Host "  Logfile: $LogFile"
