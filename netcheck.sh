@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 # ============================================================
 #  netcheck.sh – Netzwerk & WLAN Diagnose für macOS
-#  v1.2 – Fixes: DNS ms-Messung, iperf3 Hang-Timeout
+#  v1.3 – Server-Update: Paris ersetzt, dritter Server ergänzt
 #  Autor: github.com/Onslaught2508/netcheck
 #  Lizenz: MIT
 # ============================================================
 
 set -euo pipefail
 
-# ── Farben ───────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
-# ── Hilfsfunktionen ──────────────────────────────────────────
 header() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════${RESET}";
            echo -e "${BOLD}${CYAN}  $1${RESET}";
            echo -e "${BOLD}${CYAN}══════════════════════════════════════${RESET}"; }
@@ -21,12 +19,8 @@ warn()   { echo -e "  ${YELLOW}⚠${RESET}  $1"; }
 fail()   { echo -e "  ${RED}✘${RESET}  $1"; }
 info()   { echo -e "  ${CYAN}ℹ${RESET}  $1"; }
 
-# FIX v1.1/v1.2: macOS date kennt kein %3N → python3 für ms-Messung
-now_ms() {
-  python3 -c "import time; print(int(time.time() * 1000))"
-}
+now_ms() { python3 -c "import time; print(int(time.time() * 1000))"; }
 
-# FIX v1.2: iperf3 mit hartem Timeout via Background-Job
 iperf3_with_timeout() {
   local host="$1" port="$2" duration="${3:-5}" timeout_sec="${4:-20}"
   local tmpfile
@@ -54,7 +48,6 @@ iperf3_with_timeout() {
   rm -f "$tmpfile"
 }
 
-# ── Abhängigkeiten prüfen & installieren ─────────────────────
 check_deps() {
   header "🔍 Abhängigkeiten prüfen"
 
@@ -91,7 +84,6 @@ check_deps() {
   ok "Alle Abhängigkeiten erfüllt"
 }
 
-# ── System-Info ───────────────────────────────────────────────
 system_info() {
   header "💻 System-Info"
   info "Hostname:    $(hostname)"
@@ -100,7 +92,6 @@ system_info() {
   info "Nutzer:      $(whoami)"
 }
 
-# ── Netzwerk-Interfaces ───────────────────────────────────────
 network_interfaces() {
   header "🔌 Netzwerk-Interfaces"
   ifconfig | awk '
@@ -114,7 +105,6 @@ network_interfaces() {
   info "Standard-Gateway: ${GW:-nicht gefunden}"
 }
 
-# ── WLAN-Info ─────────────────────────────────────────────────
 wlan_info() {
   header "📶 WLAN – Aktuelles Netzwerk"
 
@@ -179,7 +169,6 @@ wlan_info() {
   done
 }
 
-# ── Ping / Latenz ─────────────────────────────────────────────
 latency_check() {
   header "⏱  Latenz-Test"
 
@@ -203,14 +192,12 @@ latency_check() {
   done
 }
 
-# ── Traceroute ────────────────────────────────────────────────
 traceroute_check() {
   header "🗺  Traceroute (max. 15 Hops)"
   traceroute -m 15 -w 2 8.8.8.8 2>/dev/null | head -20 || \
     warn "traceroute nicht verfügbar"
 }
 
-# ── DNS-Check ─────────────────────────────────────────────────
 dns_check() {
   header "🔎 DNS-Auflösung"
   DOMAINS=("google.com" "github.com" "heise.de")
@@ -233,14 +220,14 @@ dns_check() {
   done
 }
 
-# ── Bandbreite (iperf3) ───────────────────────────────────────
 bandwidth_check() {
   header "🚀 Bandbreiten-Test (iperf3)"
   warn "Hinweis: Testet TCP-Durchsatz zu öffentlichen iperf3-Servern"
 
+  # v1.3: Paris entfernt (offline), zwei zuverlässige Server
   SERVERS=(
-    "iperf.par2.as49434.net:9201:Paris"
-    "speedtest.serverius.net:5002:Niederlande"
+    "speedtest.serverius.net:5002:Niederlande (Serverius)"
+    "iperf.he.net:5201:USA/Fremont (Hurricane Electric)"
   )
 
   for entry in "${SERVERS[@]}"; do
@@ -254,7 +241,7 @@ bandwidth_check() {
     RESULT=$(iperf3_with_timeout "$HOST" "$PORT" 5 20)
 
     if [[ "$RESULT" == "TIMEOUT" ]]; then
-      fail "Timeout – Server $NAME nicht erreichbar oder zu langsam"
+      fail "Timeout – Server nicht erreichbar (>20s)"
       continue
     fi
 
@@ -273,12 +260,11 @@ bandwidth_check() {
       fi
     else
       ERR=$(echo "$RESULT" | grep -i "error\|refused\|failed" | head -1 | sed 's/^[[:space:]]*//')
-      fail "Fehler: ${ERR:-kein Ergebnis von $NAME}"
+      fail "Fehler: ${ERR:-kein Ergebnis}"
     fi
   done
 }
 
-# ── Zusammenfassung ───────────────────────────────────────────
 summary() {
   header "📋 Zusammenfassung"
   echo -e "  Diagnose abgeschlossen: $(date '+%H:%M:%S')"
@@ -303,7 +289,7 @@ echo "  ██║╚██╗██║██╔══╝     ██║   ██�
 echo "  ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗"
 echo "  ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝"
 echo -e "${RESET}"
-echo -e "  ${CYAN}macOS Netzwerk-Diagnose v1.2${RESET} | $(date '+%Y-%m-%d %H:%M')"
+echo -e "  ${CYAN}macOS Netzwerk-Diagnose v1.3${RESET} | $(date '+%Y-%m-%d %H:%M')"
 echo ""
 
 check_deps
