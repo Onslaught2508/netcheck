@@ -1,6 +1,6 @@
 # ============================================================
 #  netcheck.ps1 – Netzwerk & WLAN Diagnose für Windows
-#  v1.3.1 – Fix: exit 0 → return, kein Session-Abbruch bei iperf3-Install
+#  v1.4 – Fix: Select-String Object[] → String-Cast, iperf3-PATH
 #  Autor: github.com/Onslaught2508/netcheck
 #  Lizenz: MIT
 #  Ausführung: powershell -ExecutionPolicy Bypass -File netcheck.ps1
@@ -18,6 +18,16 @@ function Write-Warn($text) { Write-Host "  [!!] $text" -ForegroundColor Yellow }
 function Write-Fail($text) { Write-Host "  [XX] $text" -ForegroundColor Red }
 function Write-Info($text) { Write-Host "  [..] $text" -ForegroundColor Gray }
 
+# Hilfsfunktion: Select-String sicher als String extrahieren
+# Select-String gibt MatchInfo-Objekte zurück – kein direktes .Trim() möglich
+function Get-WlanField([string[]]$lines, [string]$pattern) {
+    $match = $lines | Select-String $pattern | Select-Object -First 1
+    if ($match) {
+        return ($match.Line -replace "^.*?:\s*", "").Trim()
+    }
+    return ""
+}
+
 # Logfile
 $LogFile = "$env:TEMP\netcheck_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 Start-Transcript -Path $LogFile -Append | Out-Null
@@ -31,7 +41,7 @@ Write-Host @"
   ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗
   ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝
 "@ -ForegroundColor Cyan
-Write-Host "  Windows Netzwerk-Diagnose v1.3.1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
+Write-Host "  Windows Netzwerk-Diagnose v1.4 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
 Write-Host ""
 
 # ── Abhängigkeiten prüfen ──────────────────────────────────────
@@ -51,15 +61,32 @@ function Check-Dependencies {
         Write-Warn "iperf3 nicht gefunden – Installationsversuch via winget..."
         try {
             winget install --id=iperf3.iperf3 -e --silent 2>&1 | Out-Null
-            # PATH neu einlesen ohne Session-Neustart
-            $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH','Machine') + ';' +
-                        [System.Environment]::GetEnvironmentVariable('PATH','User')
-            if (Get-Command iperf3 -ErrorAction SilentlyContinue) {
-                Write-Ok "iperf3 erfolgreich installiert – fahre fort"
+
+            # winget legt iperf3 typisch hier ab – direkt in PATH eintragen
+            $iperf3Candidates = @(
+                "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\iperf3.iperf3*\**\iperf3.exe",
+                "$env:ProgramFiles\iperf3\iperf3.exe",
+                "$env:ProgramFiles (x86)\iperf3\iperf3.exe"
+            )
+            $found = $null
+            foreach ($candidate in $iperf3Candidates) {
+                $found = Get-Item $candidate -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($found) { break }
+            }
+
+            if ($found) {
+                $env:PATH += ";$($found.DirectoryName)"
+                Write-Ok "iperf3 installiert und PATH aktualisiert – fahre fort"
             } else {
-                Write-Warn "iperf3 installiert – im PATH noch nicht sichtbar"
-                Write-Info "Bandbreiten-Test wird übersprungen. Skript neu starten für vollen Test."
-                # Kein exit/return – Skript läuft weiter, bandwidth_check fängt das ab
+                # Fallback: gesamten PATH neu einlesen
+                $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH','Machine') + ';' +
+                            [System.Environment]::GetEnvironmentVariable('PATH','User')
+                if (Get-Command iperf3 -ErrorAction SilentlyContinue) {
+                    Write-Ok "iperf3 verfügbar nach PATH-Refresh"
+                } else {
+                    Write-Warn "iperf3 installiert – Bandbreiten-Test in dieser Session übersprungen"
+                    Write-Info "Beim nächsten Start von netcheck ist iperf3 verfügbar."
+                }
             }
         } catch {
             Write-Fail "iperf3 konnte nicht automatisch installiert werden"
@@ -104,43 +131,58 @@ function Get-NetworkInterfaces {
 function Get-WlanInfo {
     Write-Header "📶 WLAN – Aktuelles Netzwerk"
 
-    $wlan = netsh wlan show interfaces 2>$null
-    if ($wlan -match 'There is no wireless') {
-        Write-Fail "Kein WLAN-Adapter gefunden"
+    # netsh gibt String-Array zurück – als [string[]] casten für Get-WlanField
+    [string[]]$wlan = netsh wlan show interfaces 2>$null
+
+    if (-not $wlan -or ($wlan -join '') -match 'There is no wireless') {
+        # Kein WLAN – auf Ethernet hinweisen falls vorhanden
+        $eth = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Name -notlike '*vEthernet*' }
+        if ($eth) {
+            Write-Info "Kein WLAN aktiv – Verbindung läuft über Kabel ($($eth.Name))"
+        } else {
+            Write-Fail "Kein WLAN-Adapter und kein aktives Ethernet gefunden"
+        }
         return
     }
 
-    $ssid      = ($wlan | Select-String 'SSID\s+:'      | Select-Object -First 1) -replace '.*:\s*',''
-    $bssid     = ($wlan | Select-String 'BSSID\s+:'                              ) -replace '.*:\s*',''
-    $band      = ($wlan | Select-String 'Band\s+:'                               ) -replace '.*:\s*',''
-    $channel   = ($wlan | Select-String 'Channel\s+:'                            ) -replace '.*:\s*',''
-    $signal    = ($wlan | Select-String 'Signal\s+:'                             ) -replace '.*:\s*',''
-    $rxRate    = ($wlan | Select-String 'Receive rate'                           ) -replace '.*:\s*',''
-    $txRate    = ($wlan | Select-String 'Transmit rate'                          ) -replace '.*:\s*',''
-    $radioType = ($wlan | Select-String 'Radio type'                             ) -replace '.*:\s*',''
-    $auth      = ($wlan | Select-String 'Authentication'                         ) -replace '.*:\s*',''
+    $ssid      = Get-WlanField $wlan 'SSID\s+:'
+    $bssid     = Get-WlanField $wlan 'BSSID\s+:'
+    $band      = Get-WlanField $wlan 'Band\s+:'
+    $channel   = Get-WlanField $wlan 'Channel\s+:'
+    $signal    = Get-WlanField $wlan 'Signal\s+:'
+    $rxRate    = Get-WlanField $wlan 'Receive rate'
+    $txRate    = Get-WlanField $wlan 'Transmit rate'
+    $radioType = Get-WlanField $wlan 'Radio type'
+    $auth      = Get-WlanField $wlan 'Authentication'
 
-    Write-Info "SSID:         $($ssid.Trim())"
-    Write-Info "BSSID:        $($bssid.Trim())"
-    Write-Info "Authentif.:   $($auth.Trim())"
-    Write-Info "Kanal:        $($channel.Trim())"
-    Write-Info "Empfangsrate: $($rxRate.Trim()) / Senderate: $($txRate.Trim()) Mbps"
+    Write-Info "SSID:         $ssid"
+    Write-Info "BSSID:        $bssid"
+    Write-Info "Authentif.:   $auth"
+    Write-Info "Kanal:        $channel"
+    Write-Info "Empfangsrate: $rxRate Mbps / Senderate: $txRate Mbps"
 
-    $bandVal = $band.Trim()
-    if     ($bandVal -match '5')  { Write-Ok   "Band: $bandVal  ← 5 GHz: gut" }
-    elseif ($bandVal -match '2')  { Write-Warn "Band: $bandVal  ← 2,4 GHz: Interferenzrisiko!" }
-    else                          { Write-Info "Band: $bandVal" }
+    # Band bewerten
+    if     ($band -match '5')  { Write-Ok   "Band: $band  ← 5 GHz: gut" }
+    elseif ($band -match '2')  { Write-Warn "Band: $band  ← 2,4 GHz: Interferenzrisiko!" }
+    elseif ($band -eq "")      { Write-Info "Band: nicht ermittelbar (kein WLAN aktiv?)" }
+    else                       { Write-Info "Band: $band" }
 
-    $rt = $radioType.Trim()
-    if     ($rt -match '802\.11ax') { Write-Ok   "Funkstandard: $rt  ← WiFi 6: aktuell" }
-    elseif ($rt -match '802\.11ac') { Write-Ok   "Funkstandard: $rt  ← WiFi 5: okay" }
-    elseif ($rt -match '802\.11n')  { Write-Warn "Funkstandard: $rt  ← WiFi 4: veraltet" }
-    else                            { Write-Info "Funkstandard: $rt" }
+    # Funkstandard bewerten
+    if     ($radioType -match '802\.11ax') { Write-Ok   "Funkstandard: $radioType  ← WiFi 6: aktuell" }
+    elseif ($radioType -match '802\.11ac') { Write-Ok   "Funkstandard: $radioType  ← WiFi 5: okay" }
+    elseif ($radioType -match '802\.11n')  { Write-Warn "Funkstandard: $radioType  ← WiFi 4: veraltet" }
+    elseif ($radioType -eq "")             { Write-Info "Funkstandard: nicht ermittelbar" }
+    else                                   { Write-Info "Funkstandard: $radioType" }
 
-    $sigVal = [int]($signal -replace '[^0-9]','')
-    if     ($sigVal -ge 70) { Write-Ok   "Signal: $($signal.Trim())  ← gut" }
-    elseif ($sigVal -ge 50) { Write-Warn "Signal: $($signal.Trim())  ← mittel" }
-    else                    { Write-Fail "Signal: $($signal.Trim())  ← schwach" }
+    # Signalstärke bewerten (netsh liefert "xx %" – Zahl extrahieren)
+    if ($signal -match '(\d+)') {
+        $sigVal = [int]$Matches[1]
+        if     ($sigVal -ge 70) { Write-Ok   "Signal: $signal  ← gut" }
+        elseif ($sigVal -ge 50) { Write-Warn "Signal: $signal  ← mittel" }
+        else                    { Write-Fail "Signal: $signal  ← schwach" }
+    } else {
+        Write-Info "Signal: nicht ermittelbar"
+    }
 }
 
 # ── Latenz-Test ────────────────────────────────────────────────
@@ -198,10 +240,10 @@ function Invoke-Traceroute {
 function Test-Bandwidth {
     Write-Header "🚀 Bandbreiten-Test (iperf3)"
 
-    # Prüfen ob iperf3 überhaupt verfügbar ist
     if (-not (Get-Command iperf3 -ErrorAction SilentlyContinue)) {
         Write-Warn "iperf3 nicht verfügbar – Bandbreiten-Test übersprungen"
-        Write-Info "Skript neu starten nach manueller Installation: winget install iperf3.iperf3"
+        Write-Info "Beim nächsten Start verfügbar (winget hat es bereits installiert)."
+        Write-Info "Alternativ jetzt: https://fast.com oder https://speedtest.net"
         return
     }
 
