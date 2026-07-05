@@ -1,6 +1,7 @@
 # ============================================================
 #  netcheck.ps1 – Netzwerk & WLAN Diagnose für Windows
-#  v1.4 – Fix: Select-String Object[] → String-Cast, iperf3-PATH
+#  v2.0 – Verbindungsart-Erkennung (WLAN/Ethernet/Beides)
+#        Fix: Select-String Object[] → Get-WlanField
 #  Autor: github.com/Onslaught2508/netcheck
 #  Lizenz: MIT
 #  Ausführung: powershell -ExecutionPolicy Bypass -File netcheck.ps1
@@ -18,13 +19,10 @@ function Write-Warn($text) { Write-Host "  [!!] $text" -ForegroundColor Yellow }
 function Write-Fail($text) { Write-Host "  [XX] $text" -ForegroundColor Red }
 function Write-Info($text) { Write-Host "  [..] $text" -ForegroundColor Gray }
 
-# Hilfsfunktion: Select-String sicher als String extrahieren
-# Select-String gibt MatchInfo-Objekte zurück – kein direktes .Trim() möglich
+# Select-String gibt MatchInfo-Objekte zurück – sicher als String extrahieren
 function Get-WlanField([string[]]$lines, [string]$pattern) {
     $match = $lines | Select-String $pattern | Select-Object -First 1
-    if ($match) {
-        return ($match.Line -replace "^.*?:\s*", "").Trim()
-    }
+    if ($match) { return ($match.Line -replace "^.*?:\s*", "").Trim() }
     return ""
 }
 
@@ -41,8 +39,38 @@ Write-Host @"
   ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗
   ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝
 "@ -ForegroundColor Cyan
-Write-Host "  Windows Netzwerk-Diagnose v1.4 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
+Write-Host "  Windows Netzwerk-Diagnose v2.0 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
 Write-Host ""
+
+# ── Verbindungsart erkennen ────────────────────────────────────
+function Detect-ConnectionType {
+    $script:HasWifi     = $false
+    $script:HasEthernet = $false
+    $script:WifiAdapter = $null
+    $script:EthAdapter  = $null
+
+    $activeAdapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+
+    foreach ($a in $activeAdapters) {
+        $isVirtual = $a.Name -like '*vEthernet*' -or
+                     $a.InterfaceDescription -like '*Virtual*' -or
+                     $a.InterfaceDescription -like '*Hyper-V*'
+        if ($isVirtual) { continue }
+
+        if ($a.PhysicalMediaType -eq 'Native 802.11' -or
+            $a.InterfaceDescription -like '*Wi-Fi*' -or
+            $a.InterfaceDescription -like '*Wireless*' -or
+            $a.Name -like '*Wi-Fi*' -or $a.Name -like '*WLAN*') {
+            $script:HasWifi     = $true
+            $script:WifiAdapter = $a
+        } elseif ($a.PhysicalMediaType -eq '802.3' -or
+                  $a.InterfaceDescription -like '*Ethernet*' -or
+                  $a.Name -like '*Ethernet*' -or $a.Name -like '*LAN*') {
+            $script:HasEthernet = $true
+            $script:EthAdapter  = $a
+        }
+    }
+}
 
 # ── Abhängigkeiten prüfen ──────────────────────────────────────
 function Check-Dependencies {
@@ -61,31 +89,27 @@ function Check-Dependencies {
         Write-Warn "iperf3 nicht gefunden – Installationsversuch via winget..."
         try {
             winget install --id=iperf3.iperf3 -e --silent 2>&1 | Out-Null
-
-            # winget legt iperf3 typisch hier ab – direkt in PATH eintragen
-            $iperf3Candidates = @(
+            # Bekannte Installationspfade direkt prüfen
+            $candidates = @(
                 "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\iperf3.iperf3*\**\iperf3.exe",
                 "$env:ProgramFiles\iperf3\iperf3.exe",
                 "$env:ProgramFiles (x86)\iperf3\iperf3.exe"
             )
             $found = $null
-            foreach ($candidate in $iperf3Candidates) {
-                $found = Get-Item $candidate -ErrorAction SilentlyContinue | Select-Object -First 1
+            foreach ($c in $candidates) {
+                $found = Get-Item $c -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($found) { break }
             }
-
             if ($found) {
                 $env:PATH += ";$($found.DirectoryName)"
-                Write-Ok "iperf3 installiert und PATH aktualisiert – fahre fort"
+                Write-Ok "iperf3 installiert und PATH aktualisiert"
             } else {
-                # Fallback: gesamten PATH neu einlesen
                 $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH','Machine') + ';' +
                             [System.Environment]::GetEnvironmentVariable('PATH','User')
                 if (Get-Command iperf3 -ErrorAction SilentlyContinue) {
                     Write-Ok "iperf3 verfügbar nach PATH-Refresh"
                 } else {
-                    Write-Warn "iperf3 installiert – Bandbreiten-Test in dieser Session übersprungen"
-                    Write-Info "Beim nächsten Start von netcheck ist iperf3 verfügbar."
+                    Write-Warn "iperf3 installiert – beim nächsten Start verfügbar"
                 }
             }
         } catch {
@@ -110,9 +134,22 @@ function Get-SystemInfo {
 # ── Netzwerk-Interfaces ────────────────────────────────────────
 function Get-NetworkInterfaces {
     Write-Header "🔌 Netzwerk-Interfaces"
+
+    # Verbindungsart-Zusammenfassung
+    if ($script:HasWifi -and $script:HasEthernet) {
+        Write-Warn "WLAN und Ethernet gleichzeitig aktiv – Routing-Priorität beachten"
+    } elseif ($script:HasWifi) {
+        Write-Info "Verbindungsart: WLAN ($($script:WifiAdapter.Name))"
+    } elseif ($script:HasEthernet) {
+        Write-Info "Verbindungsart: Ethernet/Kabel ($($script:EthAdapter.Name))"
+    } else {
+        Write-Fail "Keine aktive (nicht-virtuelle) Netzwerkverbindung erkannt"
+    }
+
+    Write-Host ""
+
     $adapters = Get-NetIPAddress -AddressFamily IPv4 |
         Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.*' }
-
     foreach ($a in $adapters) {
         $iface = Get-NetAdapter -InterfaceIndex $a.InterfaceIndex -ErrorAction SilentlyContinue
         if ($iface -and $iface.Status -eq 'Up') {
@@ -122,6 +159,7 @@ function Get-NetworkInterfaces {
         }
     }
 
+    Write-Host ""
     $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' |
         Sort-Object RouteMetric | Select-Object -First 1).NextHop
     Write-Info "Standard-Gateway: $gw"
@@ -129,21 +167,20 @@ function Get-NetworkInterfaces {
 
 # ── WLAN-Info ──────────────────────────────────────────────────
 function Get-WlanInfo {
-    Write-Header "📶 WLAN – Aktuelles Netzwerk"
-
-    # netsh gibt String-Array zurück – als [string[]] casten für Get-WlanField
-    [string[]]$wlan = netsh wlan show interfaces 2>$null
-
-    if (-not $wlan -or ($wlan -join '') -match 'There is no wireless') {
-        # Kein WLAN – auf Ethernet hinweisen falls vorhanden
-        $eth = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.Name -notlike '*vEthernet*' }
-        if ($eth) {
-            Write-Info "Kein WLAN aktiv – Verbindung läuft über Kabel ($($eth.Name))"
+    if (-not $script:HasWifi) {
+        Write-Header "📶 WLAN"
+        if ($script:HasEthernet) {
+            Write-Info "Kein WLAN aktiv – Verbindung läuft über Ethernet ($($script:EthAdapter.Name))"
+            Get-EthernetInfo
         } else {
-            Write-Fail "Kein WLAN-Adapter und kein aktives Ethernet gefunden"
+            Write-Fail "Keine aktive Netzwerkverbindung"
         }
         return
     }
+
+    Write-Header "📶 WLAN – Aktuelles Netzwerk ($($script:WifiAdapter.Name))"
+
+    [string[]]$wlan = netsh wlan show interfaces 2>$null
 
     $ssid      = Get-WlanField $wlan 'SSID\s+:'
     $bssid     = Get-WlanField $wlan 'BSSID\s+:'
@@ -164,7 +201,7 @@ function Get-WlanInfo {
     # Band bewerten
     if     ($band -match '5')  { Write-Ok   "Band: $band  ← 5 GHz: gut" }
     elseif ($band -match '2')  { Write-Warn "Band: $band  ← 2,4 GHz: Interferenzrisiko!" }
-    elseif ($band -eq "")      { Write-Info "Band: nicht ermittelbar (kein WLAN aktiv?)" }
+    elseif ($band -eq "")      { Write-Info "Band: nicht ermittelbar" }
     else                       { Write-Info "Band: $band" }
 
     # Funkstandard bewerten
@@ -174,7 +211,7 @@ function Get-WlanInfo {
     elseif ($radioType -eq "")             { Write-Info "Funkstandard: nicht ermittelbar" }
     else                                   { Write-Info "Funkstandard: $radioType" }
 
-    # Signalstärke bewerten (netsh liefert "xx %" – Zahl extrahieren)
+    # Signalstärke bewerten
     if ($signal -match '(\d+)') {
         $sigVal = [int]$Matches[1]
         if     ($sigVal -ge 70) { Write-Ok   "Signal: $signal  ← gut" }
@@ -185,16 +222,31 @@ function Get-WlanInfo {
     }
 }
 
+# ── Ethernet-Info (nur wenn kein WLAN) ────────────────────────
+function Get-EthernetInfo {
+    Write-Header "🔌 Ethernet-Details ($($script:EthAdapter.Name))"
+    $a = $script:EthAdapter
+    Write-Info "Adapter:       $($a.Name)"
+    Write-Info "Beschreibung:  $($a.InterfaceDescription)"
+    $speed = [math]::Round($a.LinkSpeed / 1MB, 0)
+    if ($speed -ge 1000) {
+        Write-Ok  "Geschwindigkeit: $($a.LinkSpeed / 1GB) Gbit/s  ← optimal"
+    } elseif ($speed -ge 100) {
+        Write-Ok  "Geschwindigkeit: ${speed} Mbit/s"
+    } else {
+        Write-Warn "Geschwindigkeit: ${speed} Mbit/s  ← langsam"
+    }
+    Write-Info "MAC:           $($a.MacAddress)"
+}
+
 # ── Latenz-Test ────────────────────────────────────────────────
 function Test-Latency {
     Write-Header "⏱  Latenz-Test"
-
     $targets = @(
         @{ Host = '8.8.8.8';  Name = 'Google DNS' },
         @{ Host = '1.1.1.1';  Name = 'Cloudflare DNS' },
         @{ Host = '9.9.9.9';  Name = 'Quad9 DNS' }
     )
-
     foreach ($t in $targets) {
         $result = Test-Connection -ComputerName $t.Host -Count 4 -ErrorAction SilentlyContinue
         if ($result) {
@@ -211,9 +263,7 @@ function Test-Latency {
 # ── DNS-Auflösung ──────────────────────────────────────────────
 function Test-DnsResolution {
     Write-Header "🔎 DNS-Auflösung"
-
     $domains = @('google.com', 'github.com', 'heise.de')
-
     foreach ($domain in $domains) {
         $start = Get-Date
         try {
@@ -241,7 +291,7 @@ function Test-Bandwidth {
     Write-Header "🚀 Bandbreiten-Test (iperf3)"
 
     if (-not (Get-Command iperf3 -ErrorAction SilentlyContinue)) {
-        Write-Warn "iperf3 nicht verfügbar – Bandbreiten-Test übersprungen"
+        Write-Warn "iperf3 nicht verfügbar – Test übersprungen"
         Write-Info "Beim nächsten Start verfügbar (winget hat es bereits installiert)."
         Write-Info "Alternativ jetzt: https://fast.com oder https://speedtest.net"
         return
@@ -259,7 +309,6 @@ function Test-Bandwidth {
     )
 
     $success = $false
-
     foreach ($s in $servers) {
         Write-Host ""
         Write-Host "  --> $($s.Name) ($($s.Host):$($s.Port))" -ForegroundColor White
@@ -278,31 +327,25 @@ function Test-Bandwidth {
 
         $completed = Wait-Job $job -Timeout 15
         if (-not $completed) {
-            Stop-Job $job
-            Remove-Job $job -Force
-            Write-Fail "Timeout – übersprungen"
-            continue
+            Stop-Job $job; Remove-Job $job -Force
+            Write-Fail "Timeout – übersprungen"; continue
         }
 
-        $output = Receive-Job $job
-        Remove-Job $job -Force
+        $output = Receive-Job $job; Remove-Job $job -Force
 
         if ($output -match 'iperf Done') {
             $bwLine = $output | Where-Object { $_ -match 'sender' } | Select-Object -Last 1
-            $bw     = if ($bwLine -match '([\d.]+ [MGK]bits/sec)') { $Matches[1] } else { 'unbekannt' }
-            $retr   = if ($bwLine -match '\s(\d+)\s+sender') { [int]$Matches[1] } else { $null }
-
+            $bw   = if ($bwLine -match '([\d.]+ [MGK]bits/sec)') { $Matches[1] } else { 'unbekannt' }
+            $retr = if ($bwLine -match '\s(\d+)\s+sender') { [int]$Matches[1] } else { $null }
             Write-Ok "Bandbreite: $bw"
             if ($null -ne $retr) {
                 if     ($retr -gt 50) { Write-Fail "Retransmits: $retr  ← hohe Paketverluste!" }
                 elseif ($retr -gt 10) { Write-Warn "Retransmits: $retr  ← leichte Verluste" }
                 else                  { Write-Ok   "Retransmits: $retr  ← sauber" }
             }
-            $success = $true
-            break
+            $success = $true; break
         } else {
-            $errLine = $output | Where-Object { $_ -match 'error|refused|failed' } |
-                Select-Object -First 1
+            $errLine = $output | Where-Object { $_ -match 'error|refused|failed' } | Select-Object -First 1
             Write-Fail "Fehler: $($errLine -replace '^\s*','') – übersprungen"
         }
     }
@@ -318,7 +361,12 @@ function Test-Bandwidth {
 # ── Zusammenfassung ────────────────────────────────────────────
 function Write-Summary {
     Write-Header "📋 Zusammenfassung"
+    $connType = if ($script:HasWifi -and $script:HasEthernet) { "WLAN + Ethernet" }
+                elseif ($script:HasWifi)     { "WLAN ($($script:WifiAdapter.Name))" }
+                elseif ($script:HasEthernet) { "Ethernet ($($script:EthAdapter.Name))" }
+                else                         { "keine aktive Verbindung" }
     Write-Host "  Diagnose abgeschlossen: $(Get-Date -Format 'HH:mm:ss')"
+    Write-Host "  Verbindungsart: $connType"
     Write-Host "  Logfile: $LogFile"
     Write-Host ""
     Write-Host "  Legende:"
@@ -330,6 +378,7 @@ function Write-Summary {
 }
 
 # ── Hauptprogramm ──────────────────────────────────────────────
+Detect-ConnectionType
 Check-Dependencies
 Get-SystemInfo
 Get-NetworkInterfaces
