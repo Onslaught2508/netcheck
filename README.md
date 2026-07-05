@@ -1,14 +1,18 @@
-# 🌐 netcheck
+# netcheck – Netzwerk & WLAN Diagnose
 
-Schnelle Netzwerk- & WLAN-Diagnose für **macOS** und **Windows** – direkt aus dem Terminal, ohne manuelle Installation.
+Plattformübergreifendes Diagnose-Tool für macOS und Windows.  
+Analysiert WLAN-Qualität, Latenz, DNS, Traceroute und Bandbreite – lokal, ohne Cloud-Abhängigkeit.
 
-Prüft: WLAN-Qualität, Kanal-Belegung, Latenz, DNS-Auflösung, Traceroute und Bandbreite (via iperf3).
+![Version](https://img.shields.io/badge/version-1.3-blue)
+![macOS](https://img.shields.io/badge/macOS-12%2B-lightgrey)
+![Windows](https://img.shields.io/badge/Windows-10%2F11-blue)
+![Lizenz](https://img.shields.io/badge/Lizenz-MIT-green)
 
 ---
 
-## 🚀 Schnellstart
+## Schnellstart
 
-### macOS / Linux
+### macOS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Onslaught2508/netcheck/main/netcheck.sh | bash
 ```
@@ -18,110 +22,129 @@ curl -fsSL https://raw.githubusercontent.com/Onslaught2508/netcheck/main/netchec
 irm https://raw.githubusercontent.com/Onslaught2508/netcheck/main/netcheck.ps1 | iex
 ```
 
-> **Sicherheitshinweis:** Wer lieber prüft bevor er ausführt (empfohlen):
-> ```bash
-> # macOS: erst herunterladen, prüfen, dann ausführen
-> curl -fsSL https://raw.githubusercontent.com/Onslaught2508/netcheck/main/netcheck.sh -o netcheck.sh
-> cat netcheck.sh
-> chmod +x netcheck.sh && ./netcheck.sh
-> ```
-> ```powershell
-> # Windows: erst herunterladen, prüfen, dann ausführen
-> irm https://raw.githubusercontent.com/Onslaught2508/netcheck/main/netcheck.ps1 -OutFile netcheck.ps1
-> notepad netcheck.ps1
-> powershell -ExecutionPolicy Bypass -File netcheck.ps1
-> ```
+---
+
+## Was wird geprüft?
+
+| Modul | Beschreibung |
+|---|---|
+| **Abhängigkeiten** | iperf3, Homebrew (macOS) / winget (Windows) – automatische Installation |
+| **System-Info** | Hostname, OS-Version, Nutzer, Zeitstempel |
+| **Netzwerk-Interfaces** | Aktive IPv4-Adressen, Standard-Gateway |
+| **WLAN – Aktuell** | Funkstandard (WiFi 4/5/6), Band, Kanal, Signal/Rauschen, SNR |
+| **WLAN-Umgebung** | Kanal-Belegung durch Nachbar-Netzwerke, Überfüllungs-Warnung |
+| **Latenz** | Ping zu Google DNS, Cloudflare DNS, Quad9 – mit Bewertung |
+| **DNS-Auflösung** | Auflösungszeit für google.com, github.com, heise.de |
+| **Traceroute** | Pfad zu 8.8.8.8, max. 15 Hops |
+| **Bandbreite** | TCP-Durchsatz via iperf3, Retransmit-Analyse |
 
 ---
 
-## 📋 Was wird geprüft?
+## Voraussetzungen
 
-| Modul | macOS | Windows | Beschreibung |
-|---|:---:|:---:|---|
-| **Abhängigkeiten** | ✅ | ✅ | Homebrew, iperf3, winget – automatisch installiert |
-| **System-Info** | ✅ | ✅ | OS-Version, Hostname, Nutzer |
-| **Netzwerk-Interfaces** | ✅ | ✅ | Aktive IPs, Standard-Gateway |
-| **WLAN-Netzwerk** | ✅ | ✅ | SSID, Band, Kanal, PHY-Mode, Signal/Rauschen |
-| **Kanal-Belegung** | ✅ | ✅ | Wie viele Netze teilen denselben Kanal? |
-| **Latenz** | ✅ | ✅ | Ping zu Google, Cloudflare, Quad9 |
-| **DNS-Auflösung** | ✅ | ✅ | Auflösungszeit für google.com, github.com, heise.de |
-| **Traceroute** | ✅ | ✅ | Pfad ins Internet, max. 15 Hops |
-| **Bandbreite** | ✅ | ✅ | iperf3-Test gegen Paris & Niederlande |
-| **Logfile** | ✅ | ✅ | Ergebnis automatisch gespeichert |
+### macOS
+- macOS 12 (Monterey) oder neuer
+- Xcode Command Line Tools (`xcode-select --install`)
+- Homebrew – wird automatisch installiert falls fehlend
+- iperf3 – wird automatisch via Homebrew installiert falls fehlend
+
+### Windows
+- Windows 10 / 11
+- PowerShell 5.1 oder neuer
+- winget (ab Windows 10 Build 1809 verfügbar)
+- iperf3 – wird automatisch via winget installiert falls fehlend
 
 ---
 
-## 🔍 Beispielausgabe
+## iperf3-Server (Fallback-Logik)
+
+Ab v1.3 verwendet netcheck eine **Fallback-Serverliste**: Das Skript probiert Server
+der Reihe nach durch und bricht beim ersten erfolgreichen Test ab.
+
+| Server | Port | Standort | Quelle |
+|---|---|---|---|
+| `speedtest.serverius.net` | 5002 | Niederlande | Serverius |
+| `speedtest.ams1.novogara.net` | 5201 | Amsterdam | Novogara |
+| `iperf.online.net` | 5209 | Paris | Online.net |
+| `bouygues.testdebit.info` | 5209 | Paris | Bouygues |
+| `iperf.he.net` | 5201 | Fremont, USA | Hurricane Electric |
+
+Alle Server werden auf [iperf3serverlist.net](https://iperf3serverlist.net) mit ≥90% Uptime
+über 30 Tage überwacht. Sind alle Server nicht erreichbar, gibt das Skript einen Hinweis
+mit alternativen Browser-Testlinks aus.
+
+> **Hinweis:** Öffentliche iperf3-Server können temporär überlastet oder offline sein –
+> besonders abends und am Wochenende. Das ist kein Fehler des lokalen Netzwerks.
+
+---
+
+## Ausgabe-Beispiel (macOS)
 
 ```
 ══════════════════════════════════════
   📶 WLAN – Aktuelles Netzwerk
 ══════════════════════════════════════
-  [OK]  PHY Mode: 802.11ax  ← WiFi 6: aktuell
-  [!!]  Channel: 6 (2GHz, 20MHz)  ← 2,4 GHz: Interferenzrisiko!
-  [OK]  Signal / Noise: -48 dBm / -97 dBm  ← Signal gut (SNR: 49 dB)
-
-══════════════════════════════════════
-  📡 WLAN-Umgebung (Kanal-Belegung)
-══════════════════════════════════════
-  [XX]  4 Netze auf Kanal 6 (2GHz)  ← überfüllt
-  [!!]  2 Netze auf Kanal 11 (2GHz)
-  [OK]  1 Netz  auf Kanal 36 (5GHz)
-
-══════════════════════════════════════
-  🚀 Bandbreiten-Test (iperf3)
-══════════════════════════════════════
-  → Paris (iperf.par2.as49434.net:9201)
-  [OK]  Bandbreite: 38.2 Mbits/sec
-  [OK]  Retransmits: 1  ← sauber
+  ✔  PHY Mode: 802.11ax  ← WiFi 6: aktuell
+  ✔  Channel: 36 (5GHz, 80MHz)  ← 5/6 GHz: gut
+  ✔  Signal / Noise: -62 dBm / -94 dBm  ← Signal gut (SNR: 32 dB)
+  ℹ  Transmit Rate: 612
+  ℹ  MCS Index: 6
 ```
 
 ---
 
-## ⚙️ Voraussetzungen
+## Logfile
 
-### macOS
-| Tool | Wird automatisch installiert? |
+Jeder Lauf erzeugt automatisch ein Logfile:
+
+| Plattform | Pfad |
 |---|---|
-| Xcode Command Line Tools | ✅ (Prompt) |
-| Homebrew | ✅ |
-| iperf3 | ✅ via Homebrew |
+| macOS | `/tmp/netcheck_YYYYMMDD_HHMMSS.log` |
+| Windows | `%TEMP%\netcheck_YYYYMMDD_HHMMSS.log` |
 
-### Windows
-| Tool | Wird automatisch installiert? |
+---
+
+## Bekannte Einschränkungen
+
+| Einschränkung | Erklärung |
 |---|---|
-| iperf3 | ✅ via winget |
-| ping / tracert / nslookup | ✅ Boardmittel |
-
-> PowerShell 5.1 oder neuer erforderlich (ab Windows 10 vorinstalliert).
-
----
-
-## 📁 Dateien
-
-```
-netcheck/
-├── README.md          – diese Datei
-├── netcheck.sh        – macOS/Linux Bash-Skript
-└── netcheck.ps1       – Windows PowerShell-Skript
-```
+| Ping-Latenz zu Google/Cloudflare erscheint hoch | ICMP wird von großen Providern deprioritisiert – Traceroute-Endlatenzen sind aussagekräftiger |
+| iperf3-Server offline | Öffentliche Server haben keine SLA – Fallback-Liste und Alternativlinks vorhanden |
+| WLAN-Umgebungsscan (macOS) | Benötigt `system_profiler` – funktioniert nur wenn WLAN aktiv ist |
+| Windows: Kanal-Belegung | `netsh` liefert keine Nachbar-Netzwerke – nur eigenes Netzwerk wird bewertet |
 
 ---
 
-## 🔒 Datenschutz & Sicherheit
+## Changelog
 
-- Es werden **keine Daten gesammelt oder übertragen** (außer den iperf3-Testverbindungen zu öffentlichen Servern)
-- Logfiles liegen lokal unter `/tmp/netcheck_*.log` (macOS) bzw. `%TEMP%\netcheck_*.log` (Windows)
-- Skripte können vor der Ausführung vollständig eingesehen werden (siehe Schnellstart)
+### v1.3 (2026-07-05)
+- **iperf3:** Fallback-Serverliste mit 5 Servern (EU-first, USA als letzter Fallback)
+- **iperf3:** `break` nach erstem Erfolg – kein unnötiges Weitertesten
+- **iperf3:** Timeout auf 15s reduziert (war 20s)
+- **iperf3:** Hinweis mit Alternativ-URLs bei Totalausfall aller Server
+- **Server:** Paris `iperf.par2.as49434.net` entfernt (dauerhaft offline)
+- **Server:** Amsterdam Novogara, Paris Online.net, Paris Bouygues ergänzt
+- **Windows:** `Test-NetConnection` als Vorab-Erreichbarkeitsprüfung vor iperf3-Job
+
+### v1.2 (2026-07-05)
+- **Fix:** DNS-Zeitmessung auf `python3` umgestellt – `date +%s%3N` nicht macOS-kompatibel
+- **Fix:** iperf3-Hang durch Background-Job mit hartem `kill`-Timeout behoben
+- **Fix:** Fehlertext aus iperf3-Output wird jetzt korrekt extrahiert
+
+### v1.1 (2026-07-05)
+- **Fix:** macOS-Zeitformat-Kompatibilität bei Datumsberechnungen
+
+### v1.0 (2026-07-05)
+- Erstveröffentlichung: macOS (`netcheck.sh`) und Windows (`netcheck.ps1`)
 
 ---
 
-## 📜 Lizenz
+## Lizenz
 
-MIT – frei verwendbar, veränderbar, weiterggebbar.
+MIT – siehe [LICENSE](LICENSE)
 
 ---
 
-## 👤 Autor
+## Autor
 
 [Onslaught2508](https://github.com/Onslaught2508)
