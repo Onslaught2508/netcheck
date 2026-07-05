@@ -1,32 +1,52 @@
 #!/usr/bin/env bash
 # ============================================================
 # netcheck.sh – Netzwerk & WLAN Diagnose für macOS/Linux
-# v2.3.1 – Bugfix: macOS ping -W, date %3N, airport fallback
+# v2.3.2 – Fix: Gateway-Ping robust, SSID-Parsing, Latenz-Check
 # Autor: github.com/Onslaught2508/netcheck
 # Lizenz: MIT
 # ============================================================
 
-# ── Farben ───────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; GRAY='\033[0;37m'; RESET='\033[0m'
 
-ok()   { echo -e "${GREEN} [OK] $*${RESET}"; }
-warn() { echo -e "${YELLOW} [!!] $*${RESET}"; }
-fail() { echo -e "${RED} [XX] $*${RESET}"; }
-info() { echo -e "${GRAY} [..] $*${RESET}"; }
-header() {
-  echo -e "\n${CYAN}══════════════════════════════════════\n $*\n══════════════════════════════════════${RESET}"
-}
+ok()     { echo -e "${GREEN} [OK] $*${RESET}"; }
+warn()   { echo -e "${YELLOW} [!!] $*${RESET}"; }
+fail()   { echo -e "${RED} [XX] $*${RESET}"; }
+info()   { echo -e "${GRAY} [..] $*${RESET}"; }
+header() { echo -e "\n${CYAN}══════════════════════════════════════\n $*\n══════════════════════════════════════${RESET}"; }
 
 # ── Millisekunden-Timestamp (macOS-kompatibel) ───────────────
 now_ms() {
-  if date +%s%3N 2>/dev/null | grep -qE '^[0-9]+$'; then
-    date +%s%3N
-  elif command -v python3 &>/dev/null; then
+  if command -v python3 &>/dev/null; then
     python3 -c "import time; print(int(time.time()*1000))"
   else
     echo $(( $(date +%s) * 1000 ))
   fi
+}
+
+# ── Ping-Hilfsfunktion (macOS/Linux-kompatibel) ──────────────
+# Gibt die Ausgabe zurück; Erfolg = RTT-Zeile vorhanden
+run_ping() {
+  local host="$1" count="${2:-4}"
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    ping -c "$count" -t $(( count * 3 )) "$host" 2>/dev/null
+  else
+    ping -c "$count" -W 2 "$host" 2>/dev/null
+  fi
+}
+
+ping_succeeded() {
+  # Prüft ob ping-Ausgabe echte RTT-Zeilen enthält
+  echo "$1" | grep -qE 'bytes from|time='
+}
+
+ping_avg_ms() {
+  # Extrahiert avg aus "min/avg/max/..." oder "round-trip min/avg/max"
+  echo "$1" | grep -oE '([0-9.]+/){2,}[0-9.]+' | head -1 | cut -d/ -f2
+}
+
+ping_loss_pct() {
+  echo "$1" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | grep -oE '^[0-9]+'
 }
 
 # ── Desktop-Pfad ─────────────────────────────────────────────
@@ -39,9 +59,9 @@ LOGFILE="$DESKTOP/netcheck_$(date '+%Y%m%d_%H%M%S').log"
 
 # ── Logfile-Rotation (max. 5 Dateien) ────────────────────────
 rotate_logs() {
-  local count=5 dir="$DESKTOP" logs total
+  local count=5 dir="$DESKTOP"
   mapfile -t logs < <(ls -t "$dir"/netcheck_*.log 2>/dev/null)
-  total=${#logs[@]}
+  local total=${#logs[@]}
   if (( total >= count )); then
     for (( i=count-1; i<total; i++ )); do
       rm -f "${logs[$i]}"
@@ -63,7 +83,7 @@ cat << 'EOF'
  ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗
  ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝
 EOF
-echo -e " macOS/Linux Netzwerk-Diagnose v2.3.1 | $(date '+%Y-%m-%d %H:%M')${RESET}"
+echo -e " macOS/Linux Netzwerk-Diagnose v2.3.2 | $(date '+%Y-%m-%d %H:%M')${RESET}"
 echo ""
 
 # ── Verbindungsart erkennen ──────────────────────────────────
@@ -77,7 +97,6 @@ detect_connection_type() {
               awk '/Wi-Fi|AirPort/{found=1} found && /Device:/{print $2; exit}')
     eth_if=$(networksetup -listallhardwareports 2>/dev/null | \
              awk '/Ethernet/{found=1} found && /Device:/{print $2; exit}')
-
     if [[ -n "$wifi_if" ]] && ifconfig "$wifi_if" 2>/dev/null | grep -q 'inet '; then
       HAS_WIFI=true; WIFI_IF="$wifi_if"
       local ip; ip=$(ipconfig getifaddr "$wifi_if" 2>/dev/null)
@@ -201,7 +220,6 @@ get_network_interfaces() {
 }
 
 # ── Gateway-Ping ─────────────────────────────────────────────
-# FIX: macOS ping verwendet -t (Gesamttimeout), nicht -W (pro Paket)
 test_gateway() {
   header "🚪 Gateway-Erreichbarkeit"
   local gw=""
@@ -210,31 +228,24 @@ test_gateway() {
   else
     gw=$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')
   fi
-
   if [[ -z "$gw" ]]; then fail "Kein Standard-Gateway gefunden"; return; fi
+
   info "Pinge Gateway: $gw"
+  local ping_out; ping_out=$(run_ping "$gw" 4)
 
-  local ping_out
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS: -t = Gesamttimeout in Sekunden (mind. 8 für 4 Pakete)
-    ping_out=$(ping -c 4 -t 8 "$gw" 2>/dev/null)
-  else
-    # Linux: -W = Timeout pro Paket in Sekunden
-    ping_out=$(ping -c 4 -W 2 "$gw" 2>/dev/null)
-  fi
-
-  if [[ $? -ne 0 ]] || ! echo "$ping_out" | grep -q 'bytes from'; then
+  if ! ping_succeeded "$ping_out"; then
     fail "Gateway $gw nicht erreichbar – lokales Netzwerkproblem"
     return
   fi
 
-  local loss avg
-  loss=$(echo "$ping_out" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | grep -oE '^[0-9]+')
-  avg=$(echo "$ping_out"  | grep -oE '([0-9.]+/){3}[0-9.]+' | cut -d/ -f2)
+  local loss; loss=$(ping_loss_pct "$ping_out")
+  local avg;  avg=$(ping_avg_ms "$ping_out")
 
-  if [[ "$loss" == "0" ]]; then ok "Gateway $gw erreichbar – kein Paketverlust"
-  elif [[ -n "$loss" ]];   then warn "Gateway $gw erreichbar – Paketverlust: $loss%"
-  else                          ok "Gateway $gw erreichbar"; fi
+  if [[ "$loss" == "0" || -z "$loss" ]]; then
+    ok "Gateway $gw erreichbar – kein Paketverlust"
+  else
+    warn "Gateway $gw erreichbar – Paketverlust: $loss%"
+  fi
 
   if [[ -n "$avg" ]]; then
     info "Latenz zum Gateway: ${avg} ms"
@@ -270,56 +281,56 @@ show_dns_servers() {
 }
 
 # ── WLAN-Info ────────────────────────────────────────────────
-# FIX: airport-Fallback auf system_profiler (macOS 13+)
 get_wifi_info() {
   $HAS_WIFI || return
   header "📶 WLAN-Details"
   if [[ "$OSTYPE" == "darwin"* ]]; then
     local airport="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
-    local info_out=""
 
+    # Primär: airport (macOS < Ventura)
     if [[ -x "$airport" ]]; then
-      info_out=$("$airport" -I 2>/dev/null)
-    fi
-
-    # Fallback: system_profiler (macOS Ventura+)
-    if [[ -z "$info_out" ]]; then
-      local sp_out; sp_out=$(system_profiler SPAirPortDataType 2>/dev/null)
-      if [[ -n "$sp_out" ]]; then
-        local ssid channel rate
-        ssid=$(echo "$sp_out"    | awk -F': ' '/Current Network/{found=1} found && /Network Name/{print $2; exit}')
-        channel=$(echo "$sp_out" | awk -F': ' '/Channel:/{print $2; exit}')
-        rate=$(echo "$sp_out"    | awk -F': ' '/Tx Rate:/{print $2; exit}')
+      local info_out; info_out=$("$airport" -I 2>/dev/null)
+      if [[ -n "$info_out" ]]; then
+        local ssid signal noise channel
+        ssid=$(echo "$info_out"    | awk -F': ' '/ SSID:/{gsub(/^ +/,"",$2); print $2}')
+        signal=$(echo "$info_out"  | awk '/agrCtlRSSI:/{print $2}')
+        noise=$(echo "$info_out"   | awk '/agrCtlNoise:/{print $2}')
+        channel=$(echo "$info_out" | awk '/channel:/{print $2}')
         [[ -n "$ssid" ]]    && info "SSID:    $ssid"
         [[ -n "$channel" ]] && info "Kanal:   $channel"
-        [[ -n "$rate" ]]    && info "Tx Rate: $rate Mbps"
-        # RSSI via wdutil (macOS 13+, braucht sudo – nur versuchen)
-        if command -v wdutil &>/dev/null; then
-          local rssi; rssi=$(wdutil info 2>/dev/null | awk '/RSSI/{print $2; exit}')
-          [[ -n "$rssi" ]] && info "RSSI:    $rssi dBm"
+        if [[ -n "$signal" && -n "$noise" ]]; then
+          local snr=$(( signal - noise ))
+          info "Signal: $signal dBm | Rauschen: $noise dBm | SNR: $snr dB"
+          if   (( snr >= 25 )); then ok   "Signalqualität gut (SNR ≥ 25 dB)"
+          elif (( snr >= 15 )); then warn "Signalqualität mäßig (SNR 15–24 dB)"
+          else                       fail "Signalqualität schlecht (SNR < 15 dB)"; fi
         fi
         return
       fi
-      warn "WLAN-Details: airport und system_profiler nicht verfügbar"
+    fi
+
+    # Fallback: system_profiler (macOS Ventura+)
+    local sp_out; sp_out=$(system_profiler SPAirPortDataType 2>/dev/null)
+    if [[ -n "$sp_out" ]]; then
+      # SSID: steht unter "Current Network Information:" → erste "Network Name:"-Zeile danach
+      local ssid channel rate
+      ssid=$(echo "$sp_out" | awk '
+        /Current Network Information:/{found=1; next}
+        found && /Network Name:/{
+          sub(/.*Network Name: /,""); print; exit
+        }')
+      channel=$(echo "$sp_out" | awk '/Channel:/{sub(/.*Channel: /,""); print; exit}')
+      rate=$(echo "$sp_out"    | awk '/Tx Rate:/{sub(/.*Tx Rate: /,""); print; exit}')
+      [[ -n "$ssid" ]]    && info "SSID:    $ssid"
+      [[ -n "$channel" ]] && info "Kanal:   $channel"
+      [[ -n "$rate" ]]    && info "Tx Rate: $rate Mbps"
+      [[ -z "$ssid" && -z "$channel" ]] && warn "WLAN-Details: keine Daten von system_profiler"
       return
     fi
 
-    # airport-Ausgabe auswerten
-    local ssid signal noise channel
-    ssid=$(echo "$info_out"    | awk '/ SSID:/{print $2}')
-    signal=$(echo "$info_out"  | awk '/agrCtlRSSI:/{print $2}')
-    noise=$(echo "$info_out"   | awk '/agrCtlNoise:/{print $2}')
-    channel=$(echo "$info_out" | awk '/channel:/{print $2}')
-    [[ -n "$ssid" ]]    && info "SSID:    $ssid"
-    [[ -n "$channel" ]] && info "Kanal:   $channel"
-    if [[ -n "$signal" && -n "$noise" ]]; then
-      local snr=$(( signal - noise ))
-      info "Signal: $signal dBm | Rauschen: $noise dBm | SNR: $snr dB"
-      if   (( snr >= 25 )); then ok   "Signalqualität gut (SNR ≥ 25 dB)"
-      elif (( snr >= 15 )); then warn "Signalqualität mäßig (SNR 15–24 dB)"
-      else                       fail "Signalqualität schlecht (SNR < 15 dB)"; fi
-    fi
+    warn "WLAN-Details nicht verfügbar (airport + system_profiler ohne Ausgabe)"
   else
+    # Linux
     if command -v iwconfig &>/dev/null; then
       iwconfig "$WIFI_IF" 2>/dev/null | \
         grep -E 'SSID|Quality|Signal|Bit Rate' | while read -r line; do info "  $line"; done
@@ -359,28 +370,25 @@ test_latency() {
   header "⏱ Latenz-Test"
   local -A targets=(["8.8.8.8"]="Google DNS" ["1.1.1.1"]="Cloudflare DNS" ["9.9.9.9"]="Quad9")
   for host in "${!targets[@]}"; do
-    local label="${targets[$host]}" ping_out avg avg_int
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-      ping_out=$(ping -c 4 -t 8 "$host" 2>/dev/null)
-    else
-      ping_out=$(ping -c 4 -W 2 "$host" 2>/dev/null)
-    fi
-    if [[ $? -ne 0 ]] || ! echo "$ping_out" | grep -q 'bytes from'; then
+    local label="${targets[$host]}"
+    local ping_out; ping_out=$(run_ping "$host" 4)
+    if ! ping_succeeded "$ping_out"; then
       fail "$label ($host) – nicht erreichbar"; continue
     fi
-    avg=$(echo "$ping_out" | grep -oE '([0-9.]+/){3}[0-9.]+' | cut -d/ -f2)
+    local avg; avg=$(ping_avg_ms "$ping_out")
     if [[ -n "$avg" ]]; then
-      avg_int=${avg%.*}
+      local avg_int=${avg%.*}
       if   (( avg_int < 20 )); then ok   "$label: $avg ms"
       elif (( avg_int < 60 )); then warn "$label: $avg ms (erhöht)"
       else                          fail "$label: $avg ms (hoch)"; fi
-    else ok "$label ($host) erreichbar"; fi
+    else
+      ok "$label ($host) erreichbar"
+    fi
   done
   info "Hinweis: ICMP wird von großen Providern deprioritisiert"
 }
 
 # ── DNS-Auflösung ────────────────────────────────────────────
-# FIX: now_ms() statt date +%s%3N direkt
 test_dns_resolution() {
   header "🌐 DNS-Auflösung"
   local domains=("google.com" "github.com" "heise.de")
