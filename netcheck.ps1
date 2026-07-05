@@ -1,7 +1,6 @@
 # ============================================================
 #  netcheck.ps1 – Netzwerk & WLAN Diagnose für Windows
-#  v2.0 – Verbindungsart-Erkennung (WLAN/Ethernet/Beides)
-#        Fix: Select-String Object[] → Get-WlanField
+#  v2.1 – Logfile auf Desktop (inkl. OneDrive-Umleitung)
 #  Autor: github.com/Onslaught2508/netcheck
 #  Lizenz: MIT
 #  Ausführung: powershell -ExecutionPolicy Bypass -File netcheck.ps1
@@ -19,15 +18,15 @@ function Write-Warn($text) { Write-Host "  [!!] $text" -ForegroundColor Yellow }
 function Write-Fail($text) { Write-Host "  [XX] $text" -ForegroundColor Red }
 function Write-Info($text) { Write-Host "  [..] $text" -ForegroundColor Gray }
 
-# Select-String gibt MatchInfo-Objekte zurück – sicher als String extrahieren
 function Get-WlanField([string[]]$lines, [string]$pattern) {
     $match = $lines | Select-String $pattern | Select-Object -First 1
     if ($match) { return ($match.Line -replace "^.*?:\s*", "").Trim() }
     return ""
 }
 
-# Logfile
-$LogFile = "$env:TEMP\netcheck_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+# Desktop-Pfad – robust gegen OneDrive-Umleitung
+$Desktop = [System.Environment]::GetFolderPath('Desktop')
+$LogFile = "$Desktop\netcheck_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 Start-Transcript -Path $LogFile -Append | Out-Null
 
 # ── Banner ─────────────────────────────────────────────────────
@@ -39,13 +38,14 @@ Write-Host @"
   ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗
   ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝
 "@ -ForegroundColor Cyan
-Write-Host "  Windows Netzwerk-Diagnose v2.0 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
+Write-Host "  Windows Netzwerk-Diagnose v2.1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
 Write-Host ""
 
 # ── Verbindungsart erkennen ────────────────────────────────────
 function Detect-ConnectionType {
     $script:HasWifi     = $false
     $script:HasEthernet = $false
+    $script:IsHotspot   = $false
     $script:WifiAdapter = $null
     $script:EthAdapter  = $null
 
@@ -57,15 +57,23 @@ function Detect-ConnectionType {
                      $a.InterfaceDescription -like '*Hyper-V*'
         if ($isVirtual) { continue }
 
-        if ($a.PhysicalMediaType -eq 'Native 802.11' -or
-            $a.InterfaceDescription -like '*Wi-Fi*' -or
-            $a.InterfaceDescription -like '*Wireless*' -or
-            $a.Name -like '*Wi-Fi*' -or $a.Name -like '*WLAN*') {
+        $isWifi = $a.PhysicalMediaType -eq 'Native 802.11' -or
+                  $a.InterfaceDescription -like '*Wi-Fi*' -or
+                  $a.InterfaceDescription -like '*Wireless*' -or
+                  $a.Name -like '*Wi-Fi*' -or $a.Name -like '*WLAN*'
+
+        $isEth  = $a.PhysicalMediaType -eq '802.3' -or
+                  $a.InterfaceDescription -like '*Ethernet*' -or
+                  $a.Name -like '*Ethernet*' -or $a.Name -like '*LAN*'
+
+        if ($isWifi) {
             $script:HasWifi     = $true
             $script:WifiAdapter = $a
-        } elseif ($a.PhysicalMediaType -eq '802.3' -or
-                  $a.InterfaceDescription -like '*Ethernet*' -or
-                  $a.Name -like '*Ethernet*' -or $a.Name -like '*LAN*') {
+            # Hotspot-Erkennung: 172.20.10.x = iOS Personal Hotspot
+            $wifiIP = (Get-NetIPAddress -InterfaceIndex $a.InterfaceIndex `
+                         -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+            if ($wifiIP -like '172.20.10.*') { $script:IsHotspot = $true }
+        } elseif ($isEth) {
             $script:HasEthernet = $true
             $script:EthAdapter  = $a
         }
@@ -89,7 +97,6 @@ function Check-Dependencies {
         Write-Warn "iperf3 nicht gefunden – Installationsversuch via winget..."
         try {
             winget install --id=iperf3.iperf3 -e --silent 2>&1 | Out-Null
-            # Bekannte Installationspfade direkt prüfen
             $candidates = @(
                 "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\iperf3.iperf3*\**\iperf3.exe",
                 "$env:ProgramFiles\iperf3\iperf3.exe",
@@ -117,7 +124,6 @@ function Check-Dependencies {
             Write-Info "Manuell: winget install iperf3.iperf3"
         }
     }
-
     Write-Ok "ping, tracert, nslookup: Windows-Boardmittel vorhanden"
 }
 
@@ -129,15 +135,17 @@ function Get-SystemInfo {
     Write-Info "OS:          $($os.Caption) Build $($os.BuildNumber)"
     Write-Info "Nutzer:      $env:USERNAME"
     Write-Info "Datum/Zeit:  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    Write-Info "Logfile:     $LogFile"
 }
 
 # ── Netzwerk-Interfaces ────────────────────────────────────────
 function Get-NetworkInterfaces {
     Write-Header "🔌 Netzwerk-Interfaces"
 
-    # Verbindungsart-Zusammenfassung
     if ($script:HasWifi -and $script:HasEthernet) {
         Write-Warn "WLAN und Ethernet gleichzeitig aktiv – Routing-Priorität beachten"
+    } elseif ($script:HasWifi -and $script:IsHotspot) {
+        Write-Warn "Verbindungsart: Mobiler Hotspot ($($script:WifiAdapter.Name))  ← eingeschränkte Bandbreite"
     } elseif ($script:HasWifi) {
         Write-Info "Verbindungsart: WLAN ($($script:WifiAdapter.Name))"
     } elseif ($script:HasEthernet) {
@@ -147,7 +155,6 @@ function Get-NetworkInterfaces {
     }
 
     Write-Host ""
-
     $adapters = Get-NetIPAddress -AddressFamily IPv4 |
         Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.*' }
     foreach ($a in $adapters) {
@@ -158,7 +165,6 @@ function Get-NetworkInterfaces {
             Write-Info "$($a.InterfaceAlias): $($a.IPAddress) (inaktiv)"
         }
     }
-
     Write-Host ""
     $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' |
         Sort-Object RouteMetric | Select-Object -First 1).NextHop
@@ -178,7 +184,13 @@ function Get-WlanInfo {
         return
     }
 
-    Write-Header "📶 WLAN – Aktuelles Netzwerk ($($script:WifiAdapter.Name))"
+    if ($script:IsHotspot) {
+        Write-Header "📶 WLAN – Mobiler Hotspot ($($script:WifiAdapter.Name))"
+        Write-Warn "Verbindung über mobilen Hotspot erkannt (172.20.10.x)"
+        Write-Info "Bandbreite durch Mobilfunknetz begrenzt – Ergebnisse entsprechend einordnen"
+    } else {
+        Write-Header "📶 WLAN – Aktuelles Netzwerk ($($script:WifiAdapter.Name))"
+    }
 
     [string[]]$wlan = netsh wlan show interfaces 2>$null
 
@@ -198,20 +210,17 @@ function Get-WlanInfo {
     Write-Info "Kanal:        $channel"
     Write-Info "Empfangsrate: $rxRate Mbps / Senderate: $txRate Mbps"
 
-    # Band bewerten
     if     ($band -match '5')  { Write-Ok   "Band: $band  ← 5 GHz: gut" }
     elseif ($band -match '2')  { Write-Warn "Band: $band  ← 2,4 GHz: Interferenzrisiko!" }
     elseif ($band -eq "")      { Write-Info "Band: nicht ermittelbar" }
     else                       { Write-Info "Band: $band" }
 
-    # Funkstandard bewerten
     if     ($radioType -match '802\.11ax') { Write-Ok   "Funkstandard: $radioType  ← WiFi 6: aktuell" }
     elseif ($radioType -match '802\.11ac') { Write-Ok   "Funkstandard: $radioType  ← WiFi 5: okay" }
     elseif ($radioType -match '802\.11n')  { Write-Warn "Funkstandard: $radioType  ← WiFi 4: veraltet" }
     elseif ($radioType -eq "")             { Write-Info "Funkstandard: nicht ermittelbar" }
     else                                   { Write-Info "Funkstandard: $radioType" }
 
-    # Signalstärke bewerten
     if ($signal -match '(\d+)') {
         $sigVal = [int]$Matches[1]
         if     ($sigVal -ge 70) { Write-Ok   "Signal: $signal  ← gut" }
@@ -222,19 +231,19 @@ function Get-WlanInfo {
     }
 }
 
-# ── Ethernet-Info (nur wenn kein WLAN) ────────────────────────
+# ── Ethernet-Info ─────────────────────────────────────────────
 function Get-EthernetInfo {
     Write-Header "🔌 Ethernet-Details ($($script:EthAdapter.Name))"
     $a = $script:EthAdapter
     Write-Info "Adapter:       $($a.Name)"
     Write-Info "Beschreibung:  $($a.InterfaceDescription)"
-    $speed = [math]::Round($a.LinkSpeed / 1MB, 0)
-    if ($speed -ge 1000) {
-        Write-Ok  "Geschwindigkeit: $($a.LinkSpeed / 1GB) Gbit/s  ← optimal"
-    } elseif ($speed -ge 100) {
-        Write-Ok  "Geschwindigkeit: ${speed} Mbit/s"
+    $speedMbit = [math]::Round($a.LinkSpeed / 1MB, 0)
+    if ($a.LinkSpeed -ge 1GB) {
+        Write-Ok  "Geschwindigkeit: $([math]::Round($a.LinkSpeed / 1GB, 0)) Gbit/s  ← optimal"
+    } elseif ($speedMbit -ge 100) {
+        Write-Ok  "Geschwindigkeit: ${speedMbit} Mbit/s"
     } else {
-        Write-Warn "Geschwindigkeit: ${speed} Mbit/s  ← langsam"
+        Write-Warn "Geschwindigkeit: ${speedMbit} Mbit/s  ← langsam"
     }
     Write-Info "MAC:           $($a.MacAddress)"
 }
@@ -242,6 +251,7 @@ function Get-EthernetInfo {
 # ── Latenz-Test ────────────────────────────────────────────────
 function Test-Latency {
     Write-Header "⏱  Latenz-Test"
+    if ($script:IsHotspot) { Write-Warn "Hotspot aktiv – Latenz durch Mobilfunknetz beeinflusst" }
     $targets = @(
         @{ Host = '8.8.8.8';  Name = 'Google DNS' },
         @{ Host = '1.1.1.1';  Name = 'Cloudflare DNS' },
@@ -282,6 +292,7 @@ function Test-DnsResolution {
 # ── Traceroute ─────────────────────────────────────────────────
 function Invoke-Traceroute {
     Write-Header "🗺  Traceroute (max. 15 Hops)"
+    if ($script:IsHotspot) { Write-Info "Hinweis: Hotspot-Gateways blockieren oft ICMP → viele * normal" }
     tracert -h 15 -w 2000 8.8.8.8 | Select-Object -Skip 3 | Select-Object -First 18 |
         ForEach-Object { Write-Host "  $_" }
 }
@@ -297,6 +308,7 @@ function Test-Bandwidth {
         return
     }
 
+    if ($script:IsHotspot) { Write-Warn "Hotspot aktiv – Bandbreite durch Mobilfunk begrenzt" }
     Write-Warn "Hinweis: Testet TCP-Durchsatz zu öffentlichen iperf3-Servern"
     Write-Warn "Strategie: Fallback-Liste – erster erreichbarer Server gewinnt"
 
@@ -312,13 +324,9 @@ function Test-Bandwidth {
     foreach ($s in $servers) {
         Write-Host ""
         Write-Host "  --> $($s.Name) ($($s.Host):$($s.Port))" -ForegroundColor White
-
         $tcpTest = Test-NetConnection -ComputerName $s.Host -Port $s.Port `
                        -WarningAction SilentlyContinue -InformationLevel Quiet
-        if (-not $tcpTest) {
-            Write-Fail "TCP-Verbindung fehlgeschlagen – übersprungen"
-            continue
-        }
+        if (-not $tcpTest) { Write-Fail "TCP-Verbindung fehlgeschlagen – übersprungen"; continue }
 
         $job = Start-Job -ScriptBlock {
             param($h, $p)
@@ -345,7 +353,8 @@ function Test-Bandwidth {
             }
             $success = $true; break
         } else {
-            $errLine = $output | Where-Object { $_ -match 'error|refused|failed' } | Select-Object -First 1
+            $errLine = $output | Where-Object { $_ -match 'error|refused|failed|busy' } |
+                Select-Object -First 1
             Write-Fail "Fehler: $($errLine -replace '^\s*','') – übersprungen"
         }
     }
@@ -362,6 +371,7 @@ function Test-Bandwidth {
 function Write-Summary {
     Write-Header "📋 Zusammenfassung"
     $connType = if ($script:HasWifi -and $script:HasEthernet) { "WLAN + Ethernet" }
+                elseif ($script:HasWifi -and $script:IsHotspot) { "Mobiler Hotspot ($($script:WifiAdapter.Name))" }
                 elseif ($script:HasWifi)     { "WLAN ($($script:WifiAdapter.Name))" }
                 elseif ($script:HasEthernet) { "Ethernet ($($script:EthAdapter.Name))" }
                 else                         { "keine aktive Verbindung" }
