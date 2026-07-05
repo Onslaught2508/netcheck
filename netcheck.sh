@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # netcheck.sh – Netzwerk & WLAN Diagnose für macOS/Linux
-# v2.3.2 – Fix: Gateway-Ping robust, SSID-Parsing, Latenz-Check
+# v2.3.3 – Fix: Gateway ICMP-Block erkannt, curl-Reachability
 # Autor: github.com/Onslaught2508/netcheck
 # Lizenz: MIT
 # ============================================================
@@ -24,8 +24,7 @@ now_ms() {
   fi
 }
 
-# ── Ping-Hilfsfunktion (macOS/Linux-kompatibel) ──────────────
-# Gibt die Ausgabe zurück; Erfolg = RTT-Zeile vorhanden
+# ── Ping-Hilfsfunktionen (OS-kompatibel) ─────────────────────
 run_ping() {
   local host="$1" count="${2:-4}"
   if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -35,19 +34,9 @@ run_ping() {
   fi
 }
 
-ping_succeeded() {
-  # Prüft ob ping-Ausgabe echte RTT-Zeilen enthält
-  echo "$1" | grep -qE 'bytes from|time='
-}
-
-ping_avg_ms() {
-  # Extrahiert avg aus "min/avg/max/..." oder "round-trip min/avg/max"
-  echo "$1" | grep -oE '([0-9.]+/){2,}[0-9.]+' | head -1 | cut -d/ -f2
-}
-
-ping_loss_pct() {
-  echo "$1" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | grep -oE '^[0-9]+'
-}
+ping_succeeded() { echo "$1" | grep -qE 'bytes from|time='; }
+ping_avg_ms()    { echo "$1" | grep -oE '([0-9.]+/){2,}[0-9.]+' | head -1 | cut -d/ -f2; }
+ping_loss_pct()  { echo "$1" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | grep -oE '^[0-9]+'; }
 
 # ── Desktop-Pfad ─────────────────────────────────────────────
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -83,7 +72,7 @@ cat << 'EOF'
  ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗
  ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝
 EOF
-echo -e " macOS/Linux Netzwerk-Diagnose v2.3.2 | $(date '+%Y-%m-%d %H:%M')${RESET}"
+echo -e " macOS/Linux Netzwerk-Diagnose v2.3.3 | $(date '+%Y-%m-%d %H:%M')${RESET}"
 echo ""
 
 # ── Verbindungsart erkennen ──────────────────────────────────
@@ -219,7 +208,9 @@ get_network_interfaces() {
   else warn "Standard-Gateway nicht ermittelbar"; fi
 }
 
-# ── Gateway-Ping ─────────────────────────────────────────────
+# ── Gateway-Erreichbarkeit ───────────────────────────────────
+# Strategie: erst Ping versuchen; wenn kein ICMP → TCP-Check (nc/curl)
+# Ein blockierter Ping ist kein Netzwerkfehler.
 test_gateway() {
   header "🚪 Gateway-Erreichbarkeit"
   local gw=""
@@ -228,29 +219,59 @@ test_gateway() {
   else
     gw=$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')
   fi
-  if [[ -z "$gw" ]]; then fail "Kein Standard-Gateway gefunden"; return; fi
+  if [[ -z "$gw" ]]; then fail "Kein Standard-Gateway gefunden – Netzwerkkonfiguration prüfen"; return; fi
 
-  info "Pinge Gateway: $gw"
+  info "Gateway: $gw"
+
+  # 1) Ping-Versuch
   local ping_out; ping_out=$(run_ping "$gw" 4)
 
-  if ! ping_succeeded "$ping_out"; then
-    fail "Gateway $gw nicht erreichbar – lokales Netzwerkproblem"
+  if ping_succeeded "$ping_out"; then
+    # Ping hat funktioniert
+    local loss; loss=$(ping_loss_pct "$ping_out")
+    local avg;  avg=$(ping_avg_ms "$ping_out")
+    if [[ "$loss" == "0" || -z "$loss" ]]; then
+      ok "Gateway erreichbar via ICMP – kein Paketverlust"
+    else
+      warn "Gateway erreichbar – Paketverlust: $loss%"
+    fi
+    if [[ -n "$avg" ]]; then
+      info "Latenz zum Gateway: ${avg} ms"
+      if (( $(echo "$avg > 10" | bc -l 2>/dev/null || echo 0) )); then
+        warn "Latenz > 10 ms – lokale Verbindung prüfen (WLAN-Signal, Kabel)"
+      fi
+    fi
     return
   fi
 
-  local loss; loss=$(ping_loss_pct "$ping_out")
-  local avg;  avg=$(ping_avg_ms "$ping_out")
+  # 2) Ping fehlgeschlagen → TCP-Fallback auf Port 53 oder 80
+  info "ICMP blockiert oder kein Ping – prüfe TCP-Erreichbarkeit..."
+  local tcp_ok=false
 
-  if [[ "$loss" == "0" || -z "$loss" ]]; then
-    ok "Gateway $gw erreichbar – kein Paketverlust"
-  else
-    warn "Gateway $gw erreichbar – Paketverlust: $loss%"
+  # nc (netcat) auf Port 53 (DNS) – fast jeder Router hat das offen
+  if command -v nc &>/dev/null; then
+    if nc -z -w 2 "$gw" 53 2>/dev/null || \
+       nc -z -w 2 "$gw" 80 2>/dev/null || \
+       nc -z -w 2 "$gw" 443 2>/dev/null; then
+      tcp_ok=true
+    fi
   fi
 
-  if [[ -n "$avg" ]]; then
-    info "Latenz zum Gateway: ${avg} ms"
-    if (( $(echo "$avg > 10" | bc -l 2>/dev/null || echo 0) )); then
-      warn "Latenz > 10 ms – lokale Verbindung prüfen (WLAN-Signal, Kabel)"
+  # curl als weiterer Fallback (HTTP zum Gateway)
+  if ! $tcp_ok && command -v curl &>/dev/null; then
+    if curl -s --connect-timeout 3 --max-time 3 "http://$gw" -o /dev/null 2>/dev/null; then
+      tcp_ok=true
+    fi
+  fi
+
+  if $tcp_ok; then
+    ok "Gateway erreichbar (ICMP geblockt, TCP antwortet – normal bei FritzBox/Firewall)"
+  else
+    # 3) Letzter Check: Ist Internet trotzdem erreichbar?
+    if curl -s --connect-timeout 3 --max-time 5 "https://1.1.1.1" -o /dev/null 2>/dev/null; then
+      warn "Gateway antwortet nicht direkt – Internet aber erreichbar (Routing funktioniert)"
+    else
+      fail "Gateway $gw nicht erreichbar – lokales Netzwerkproblem prüfen"
     fi
   fi
 }
@@ -287,7 +308,6 @@ get_wifi_info() {
   if [[ "$OSTYPE" == "darwin"* ]]; then
     local airport="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
 
-    # Primär: airport (macOS < Ventura)
     if [[ -x "$airport" ]]; then
       local info_out; info_out=$("$airport" -I 2>/dev/null)
       if [[ -n "$info_out" ]]; then
@@ -312,7 +332,6 @@ get_wifi_info() {
     # Fallback: system_profiler (macOS Ventura+)
     local sp_out; sp_out=$(system_profiler SPAirPortDataType 2>/dev/null)
     if [[ -n "$sp_out" ]]; then
-      # SSID: steht unter "Current Network Information:" → erste "Network Name:"-Zeile danach
       local ssid channel rate
       ssid=$(echo "$sp_out" | awk '
         /Current Network Information:/{found=1; next}
@@ -328,9 +347,8 @@ get_wifi_info() {
       return
     fi
 
-    warn "WLAN-Details nicht verfügbar (airport + system_profiler ohne Ausgabe)"
+    warn "WLAN-Details nicht verfügbar"
   else
-    # Linux
     if command -v iwconfig &>/dev/null; then
       iwconfig "$WIFI_IF" 2>/dev/null | \
         grep -E 'SSID|Quality|Signal|Bit Rate' | while read -r line; do info "  $line"; done
