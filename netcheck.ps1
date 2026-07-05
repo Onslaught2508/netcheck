@@ -1,6 +1,6 @@
 # ============================================================
 #  netcheck.ps1 – Netzwerk & WLAN Diagnose für Windows
-#  v1.3 – Fallback-Serverliste, robuste iperf3-Logik
+#  v1.3.1 – Fix: exit 0 → return, kein Session-Abbruch bei iperf3-Install
 #  Autor: github.com/Onslaught2508/netcheck
 #  Lizenz: MIT
 #  Ausführung: powershell -ExecutionPolicy Bypass -File netcheck.ps1
@@ -31,7 +31,7 @@ Write-Host @"
   ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗
   ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝
 "@ -ForegroundColor Cyan
-Write-Host "  Windows Netzwerk-Diagnose v1.3 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
+Write-Host "  Windows Netzwerk-Diagnose v1.3.1 | $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
 Write-Host ""
 
 # ── Abhängigkeiten prüfen ──────────────────────────────────────
@@ -48,12 +48,19 @@ function Check-Dependencies {
     if (Get-Command iperf3 -ErrorAction SilentlyContinue) {
         Write-Ok "iperf3 verfügbar"
     } else {
-        Write-Warn "iperf3 nicht gefunden – wird via winget installiert..."
+        Write-Warn "iperf3 nicht gefunden – Installationsversuch via winget..."
         try {
-            winget install --id=iperf3.iperf3 -e --silent
-            Write-Ok "iperf3 installiert – bitte Skript neu starten"
-            Stop-Transcript | Out-Null
-            exit 0
+            winget install --id=iperf3.iperf3 -e --silent 2>&1 | Out-Null
+            # PATH neu einlesen ohne Session-Neustart
+            $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH','Machine') + ';' +
+                        [System.Environment]::GetEnvironmentVariable('PATH','User')
+            if (Get-Command iperf3 -ErrorAction SilentlyContinue) {
+                Write-Ok "iperf3 erfolgreich installiert – fahre fort"
+            } else {
+                Write-Warn "iperf3 installiert – im PATH noch nicht sichtbar"
+                Write-Info "Bandbreiten-Test wird übersprungen. Skript neu starten für vollen Test."
+                # Kein exit/return – Skript läuft weiter, bandwidth_check fängt das ab
+            }
         } catch {
             Write-Fail "iperf3 konnte nicht automatisch installiert werden"
             Write-Info "Manuell: winget install iperf3.iperf3"
@@ -113,26 +120,23 @@ function Get-WlanInfo {
     $radioType = ($wlan | Select-String 'Radio type'                             ) -replace '.*:\s*',''
     $auth      = ($wlan | Select-String 'Authentication'                         ) -replace '.*:\s*',''
 
-    Write-Info "SSID:        $($ssid.Trim())"
-    Write-Info "BSSID:       $($bssid.Trim())"
-    Write-Info "Authentif.:  $($auth.Trim())"
-    Write-Info "Kanal:       $($channel.Trim())"
+    Write-Info "SSID:         $($ssid.Trim())"
+    Write-Info "BSSID:        $($bssid.Trim())"
+    Write-Info "Authentif.:   $($auth.Trim())"
+    Write-Info "Kanal:        $($channel.Trim())"
     Write-Info "Empfangsrate: $($rxRate.Trim()) / Senderate: $($txRate.Trim()) Mbps"
 
-    # Band bewerten
     $bandVal = $band.Trim()
     if     ($bandVal -match '5')  { Write-Ok   "Band: $bandVal  ← 5 GHz: gut" }
     elseif ($bandVal -match '2')  { Write-Warn "Band: $bandVal  ← 2,4 GHz: Interferenzrisiko!" }
     else                          { Write-Info "Band: $bandVal" }
 
-    # Funkstandard bewerten
     $rt = $radioType.Trim()
     if     ($rt -match '802\.11ax') { Write-Ok   "Funkstandard: $rt  ← WiFi 6: aktuell" }
     elseif ($rt -match '802\.11ac') { Write-Ok   "Funkstandard: $rt  ← WiFi 5: okay" }
     elseif ($rt -match '802\.11n')  { Write-Warn "Funkstandard: $rt  ← WiFi 4: veraltet" }
     else                            { Write-Info "Funkstandard: $rt" }
 
-    # Signalstärke bewerten
     $sigVal = [int]($signal -replace '[^0-9]','')
     if     ($sigVal -ge 70) { Write-Ok   "Signal: $($signal.Trim())  ← gut" }
     elseif ($sigVal -ge 50) { Write-Warn "Signal: $($signal.Trim())  ← mittel" }
@@ -152,8 +156,7 @@ function Test-Latency {
     foreach ($t in $targets) {
         $result = Test-Connection -ComputerName $t.Host -Count 4 -ErrorAction SilentlyContinue
         if ($result) {
-            $avg = ($result | Measure-Object -Property ResponseTime -Average).Average
-            $avg = [math]::Round($avg, 1)
+            $avg = [math]::Round(($result | Measure-Object -Property ResponseTime -Average).Average, 1)
             if     ($avg -lt 30) { Write-Ok   "$($t.Name) ($($t.Host)): ${avg} ms  ← gut" }
             elseif ($avg -lt 80) { Write-Warn "$($t.Name) ($($t.Host)): ${avg} ms  ← akzeptabel" }
             else                 { Write-Fail "$($t.Name) ($($t.Host)): ${avg} ms  ← hoch" }
@@ -175,7 +178,6 @@ function Test-DnsResolution {
             $ip = (Resolve-DnsName $domain -Type A -ErrorAction Stop |
                 Where-Object { $_.IPAddress } | Select-Object -First 1).IPAddress
             $ms = [math]::Round(((Get-Date) - $start).TotalMilliseconds)
-
             if     ($ms -lt 50)  { Write-Ok   "$domain → $ip  (${ms} ms)" }
             elseif ($ms -lt 150) { Write-Warn "$domain → $ip  (${ms} ms)  ← etwas langsam" }
             else                 { Write-Fail "$domain → $ip  (${ms} ms)  ← langsam" }
@@ -195,11 +197,17 @@ function Invoke-Traceroute {
 # ── Bandbreiten-Test (iperf3) ──────────────────────────────────
 function Test-Bandwidth {
     Write-Header "🚀 Bandbreiten-Test (iperf3)"
+
+    # Prüfen ob iperf3 überhaupt verfügbar ist
+    if (-not (Get-Command iperf3 -ErrorAction SilentlyContinue)) {
+        Write-Warn "iperf3 nicht verfügbar – Bandbreiten-Test übersprungen"
+        Write-Info "Skript neu starten nach manueller Installation: winget install iperf3.iperf3"
+        return
+    }
+
     Write-Warn "Hinweis: Testet TCP-Durchsatz zu öffentlichen iperf3-Servern"
     Write-Warn "Strategie: Fallback-Liste – erster erreichbarer Server gewinnt"
 
-    # Quellen: iperf3serverlist.net (≥90% Uptime, Europa, überwacht)
-    # v1.3: Paris entfernt (offline), Fallback-Liste mit 5 Servern
     $servers = @(
         @{ Host = 'speedtest.serverius.net';      Port = 5002; Name = 'Niederlande (Serverius)' },
         @{ Host = 'speedtest.ams1.novogara.net';  Port = 5201; Name = 'Amsterdam (Novogara)' },
@@ -214,7 +222,6 @@ function Test-Bandwidth {
         Write-Host ""
         Write-Host "  --> $($s.Name) ($($s.Host):$($s.Port))" -ForegroundColor White
 
-        # Vorab-Erreichbarkeit prüfen (TCP-Connect, 4s Timeout)
         $tcpTest = Test-NetConnection -ComputerName $s.Host -Port $s.Port `
                        -WarningAction SilentlyContinue -InformationLevel Quiet
         if (-not $tcpTest) {
@@ -222,7 +229,6 @@ function Test-Bandwidth {
             continue
         }
 
-        # iperf3 mit Job + Timeout (15s)
         $job = Start-Job -ScriptBlock {
             param($h, $p)
             & iperf3 -c $h -p $p -t 5 --connect-timeout 4000 2>&1
@@ -240,7 +246,6 @@ function Test-Bandwidth {
         Remove-Job $job -Force
 
         if ($output -match 'iperf Done') {
-            # Bandbreite extrahieren
             $bwLine = $output | Where-Object { $_ -match 'sender' } | Select-Object -Last 1
             $bw     = if ($bwLine -match '([\d.]+ [MGK]bits/sec)') { $Matches[1] } else { 'unbekannt' }
             $retr   = if ($bwLine -match '\s(\d+)\s+sender') { [int]$Matches[1] } else { $null }
@@ -252,7 +257,7 @@ function Test-Bandwidth {
                 else                  { Write-Ok   "Retransmits: $retr  ← sauber" }
             }
             $success = $true
-            break   # Erster Erfolg reicht
+            break
         } else {
             $errLine = $output | Where-Object { $_ -match 'error|refused|failed' } |
                 Select-Object -First 1
