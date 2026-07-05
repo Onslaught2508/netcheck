@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  netcheck.sh – Netzwerk & WLAN Diagnose für macOS
+#  v1.1 – Fixes: DNS-Zeitmessung, iperf3-Timeout
 #  Autor: github.com/Onslaught2508/netcheck
 #  Lizenz: MIT
 # ============================================================
@@ -12,19 +13,21 @@ RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
 # ── Hilfsfunktionen ──────────────────────────────────────────
-header()  { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════${RESET}"; \
-             echo -e "${BOLD}${CYAN}  $1${RESET}"; \
-             echo -e "${BOLD}${CYAN}══════════════════════════════════════${RESET}"; }
-ok()      { echo -e "  ${GREEN}✔${RESET}  $1"; }
-warn()    { echo -e "  ${YELLOW}⚠${RESET}  $1"; }
-fail()    { echo -e "  ${RED}✘${RESET}  $1"; }
-info()    { echo -e "  ${CYAN}ℹ${RESET}  $1"; }
+header() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════${RESET}";
+           echo -e "${BOLD}${CYAN}  $1${RESET}";
+           echo -e "${BOLD}${CYAN}══════════════════════════════════════${RESET}"; }
+ok()     { echo -e "  ${GREEN}✔${RESET}  $1"; }
+warn()   { echo -e "  ${YELLOW}⚠${RESET}  $1"; }
+fail()   { echo -e "  ${RED}✘${RESET}  $1"; }
+info()   { echo -e "  ${CYAN}ℹ${RESET}  $1"; }
+
+# Millisekunden – macOS-kompatibel via python3
+now_ms() { python3 -c "import time; print(int(time.time() * 1000))"; }
 
 # ── Abhängigkeiten prüfen & installieren ─────────────────────
 check_deps() {
   header "🔍 Abhängigkeiten prüfen"
 
-  # Xcode Command Line Tools (für ping, traceroute etc.)
   if ! xcode-select -p &>/dev/null; then
     warn "Xcode Command Line Tools fehlen – werden installiert..."
     xcode-select --install
@@ -34,7 +37,6 @@ check_deps() {
     ok "Xcode Command Line Tools vorhanden"
   fi
 
-  # Homebrew
   if ! command -v brew &>/dev/null; then
     warn "Homebrew nicht gefunden – wird installiert..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -42,7 +44,6 @@ check_deps() {
     ok "Homebrew vorhanden ($(brew --version | head -1))"
   fi
 
-  # iperf3
   if ! command -v iperf3 &>/dev/null; then
     warn "iperf3 fehlt – wird via Homebrew installiert..."
     brew install iperf3
@@ -50,7 +51,6 @@ check_deps() {
     ok "iperf3 vorhanden ($(iperf3 --version | head -1))"
   fi
 
-  # traceroute (meist vorhanden, sicherheitshalber)
   if ! command -v traceroute &>/dev/null; then
     warn "traceroute fehlt – wird installiert..."
     brew install inetutils
@@ -73,7 +73,6 @@ system_info() {
 # ── Netzwerk-Interfaces ───────────────────────────────────────
 network_interfaces() {
   header "🔌 Netzwerk-Interfaces"
-  # Aktive Interfaces mit IP
   ifconfig | awk '
     /^[a-z]/ { iface=$1 }
     /inet / && !/127.0.0.1/ {
@@ -81,7 +80,6 @@ network_interfaces() {
     }
   '
   echo ""
-  # Standard-Gateway
   GW=$(netstat -rn | awk '/default/{print $2; exit}')
   info "Standard-Gateway: ${GW:-nicht gefunden}"
 }
@@ -92,8 +90,11 @@ wlan_info() {
 
   WLAN_RAW=$(system_profiler SPAirPortDataType 2>/dev/null)
 
-  # Verbundenes Netz
-  CURRENT=$(echo "$WLAN_RAW" | awk '/Current Network Information:/{found=1} found && /PHY Mode|Channel|Signal|Transmit Rate|MCS/{print; count++} count==5{exit}')
+  CURRENT=$(echo "$WLAN_RAW" | awk '
+    /Current Network Information:/{found=1; count=0}
+    found && /PHY Mode|Channel|Signal|Transmit Rate|MCS/{print; count++}
+    count==5{exit}
+  ')
 
   if [[ -z "$CURRENT" ]]; then
     fail "Kein WLAN verbunden"
@@ -103,27 +104,22 @@ wlan_info() {
   echo "$CURRENT" | while IFS= read -r line; do
     trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
 
-    # Kanal-Bewertung
     if echo "$trimmed" | grep -q "Channel:"; then
       if echo "$trimmed" | grep -q "2GHz"; then
         warn "$trimmed  ← 2,4 GHz: Interferenzrisiko!"
       else
         ok "$trimmed  ← 5/6 GHz: gut"
       fi
-
-    # PHY-Mode-Bewertung
     elif echo "$trimmed" | grep -q "PHY Mode:"; then
-      if echo "$trimmed" | grep -qE "ax|WiFi 6"; then
+      if echo "$trimmed" | grep -qE "\.11ax"; then
         ok "$trimmed  ← WiFi 6: aktuell"
-      elif echo "$trimmed" | grep -q "ac"; then
+      elif echo "$trimmed" | grep -q "\.11ac"; then
         ok "$trimmed  ← WiFi 5: okay"
       elif echo "$trimmed" | grep -q "\.11n"; then
         warn "$trimmed  ← WiFi 4: veraltet"
       else
         info "$trimmed"
       fi
-
-    # Signal-Bewertung
     elif echo "$trimmed" | grep -q "Signal / Noise:"; then
       RSSI=$(echo "$trimmed" | grep -oE '\-[0-9]+' | head -1)
       NOISE=$(echo "$trimmed" | grep -oE '\-[0-9]+' | tail -1)
@@ -140,9 +136,9 @@ wlan_info() {
     fi
   done
 
-  # Umgebungs-Netze zählen pro Kanal
   header "📡 WLAN-Umgebung (Kanal-Belegung)"
-  echo "$WLAN_RAW" | grep "Channel:" | grep -oE '[0-9]+ \([^)]+\)' | sort | uniq -c | sort -rn | while read count channel; do
+  echo "$WLAN_RAW" | grep "Channel:" | grep -oE '[0-9]+ \([^)]+\)' | sort | uniq -c | sort -rn | \
+  while read -r count channel; do
     if [[ $count -ge 4 ]]; then
       fail "  $count Netze auf Kanal $channel  ← überfüllt"
     elif [[ $count -ge 2 ]]; then
@@ -185,16 +181,23 @@ traceroute_check() {
 }
 
 # ── DNS-Check ─────────────────────────────────────────────────
+# FIX v1.1: date +%s%3N funktioniert auf macOS nicht → python3
 dns_check() {
   header "🔎 DNS-Auflösung"
   DOMAINS=("google.com" "github.com" "heise.de")
   for domain in "${DOMAINS[@]}"; do
-    START=$(date +%s%3N)
-    IP=$(dig +short "$domain" 2>/dev/null | head -1)
-    END=$(date +%s%3N)
+    START=$(now_ms)
+    IP=$(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+    END=$(now_ms)
     MS=$((END - START))
     if [[ -n "$IP" ]]; then
-      ok "$domain → $IP  (${MS} ms)"
+      if [[ $MS -lt 50 ]]; then
+        ok "$domain → $IP  (${MS} ms)"
+      elif [[ $MS -lt 150 ]]; then
+        warn "$domain → $IP  (${MS} ms)  ← etwas langsam"
+      else
+        fail "$domain → $IP  (${MS} ms)  ← langsam"
+      fi
     else
       fail "$domain → nicht auflösbar"
     fi
@@ -202,6 +205,7 @@ dns_check() {
 }
 
 # ── Bandbreite (iperf3) ───────────────────────────────────────
+# FIX v1.1: explizites --connect-timeout + Prozess-Timeout via `timeout`
 bandwidth_check() {
   header "🚀 Bandbreiten-Test (iperf3)"
   warn "Hinweis: Testet TCP-Durchsatz zu öffentlichen iperf3-Servern"
@@ -219,21 +223,30 @@ bandwidth_check() {
 
     echo -e "\n  ${BOLD}→ $NAME ($HOST:$PORT)${RESET}"
 
-    RESULT=$(iperf3 -c "$HOST" -p "$PORT" -t 5 --connect-timeout 3000 2>&1)
+    # gtimeout von coreutils falls vorhanden, sonst direkt (macOS hat kein timeout)
+    if command -v gtimeout &>/dev/null; then
+      RESULT=$(gtimeout 20 iperf3 -c "$HOST" -p "$PORT" -t 5 --connect-timeout 5000 2>&1 || true)
+    else
+      RESULT=$(iperf3 -c "$HOST" -p "$PORT" -t 5 --connect-timeout 5000 2>&1 || true)
+    fi
 
     if echo "$RESULT" | grep -q "iperf Done"; then
       BW=$(echo "$RESULT" | grep "sender" | grep -oE '[0-9.]+ [MGK]bits/sec' | tail -1)
-      RETR=$(echo "$RESULT" | grep "sender" | grep -oE '[0-9]+ +sender' | awk '{print $1}')
+      RETR=$(echo "$RESULT" | grep "sender" | awk '{print $9}')
       ok "Bandbreite: ${BW:-unbekannt}"
-      if [[ -n "$RETR" && "$RETR" -gt 50 ]]; then
-        fail "Retransmits: $RETR  ← hohe Paketverluste!"
-      elif [[ -n "$RETR" && "$RETR" -gt 10 ]]; then
-        warn "Retransmits: $RETR  ← leichte Verluste"
-      else
-        ok "Retransmits: ${RETR:-0}  ← sauber"
+      if [[ -n "$RETR" ]] && [[ "$RETR" =~ ^[0-9]+$ ]]; then
+        if [[ $RETR -gt 50 ]]; then
+          fail "Retransmits: $RETR  ← hohe Paketverluste!"
+        elif [[ $RETR -gt 10 ]]; then
+          warn "Retransmits: $RETR  ← leichte Verluste"
+        else
+          ok "Retransmits: $RETR  ← sauber"
+        fi
       fi
+    elif echo "$RESULT" | grep -q "Connection refused\|unable to connect\|error"; then
+      fail "Server nicht erreichbar ($NAME)"
     else
-      fail "Server nicht erreichbar oder Timeout"
+      warn "Kein Ergebnis von $NAME – Server möglicherweise überlastet"
     fi
   done
 }
@@ -253,8 +266,6 @@ summary() {
 
 # ── Hauptprogramm ─────────────────────────────────────────────
 LOGFILE="/tmp/netcheck_$(date +%Y%m%d_%H%M%S).log"
-
-# Alles in Logfile UND Terminal ausgeben
 exec > >(tee -a "$LOGFILE") 2>&1
 
 echo -e "${BOLD}${CYAN}"
@@ -265,7 +276,7 @@ echo "  ██║╚██╗██║██╔══╝     ██║   ██�
 echo "  ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗"
 echo "  ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝"
 echo -e "${RESET}"
-echo -e "  ${CYAN}macOS Netzwerk-Diagnose${RESET} | $(date '+%Y-%m-%d %H:%M')"
+echo -e "  ${CYAN}macOS Netzwerk-Diagnose v1.1${RESET} | $(date '+%Y-%m-%d %H:%M')"
 echo ""
 
 check_deps
