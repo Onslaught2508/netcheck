@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  netcheck.sh – Netzwerk & WLAN Diagnose für macOS
-#  v1.1 – Fixes: DNS-Zeitmessung, iperf3-Timeout
+#  v1.2 – Fixes: DNS ms-Messung, iperf3 Hang-Timeout
 #  Autor: github.com/Onslaught2508/netcheck
 #  Lizenz: MIT
 # ============================================================
@@ -21,8 +21,38 @@ warn()   { echo -e "  ${YELLOW}⚠${RESET}  $1"; }
 fail()   { echo -e "  ${RED}✘${RESET}  $1"; }
 info()   { echo -e "  ${CYAN}ℹ${RESET}  $1"; }
 
-# Millisekunden – macOS-kompatibel via python3
-now_ms() { python3 -c "import time; print(int(time.time() * 1000))"; }
+# FIX v1.1/v1.2: macOS date kennt kein %3N → python3 für ms-Messung
+now_ms() {
+  python3 -c "import time; print(int(time.time() * 1000))"
+}
+
+# FIX v1.2: iperf3 mit hartem Timeout via Background-Job
+iperf3_with_timeout() {
+  local host="$1" port="$2" duration="${3:-5}" timeout_sec="${4:-20}"
+  local tmpfile
+  tmpfile=$(mktemp /tmp/iperf3_XXXXXX)
+
+  iperf3 -c "$host" -p "$port" -t "$duration" --connect-timeout 5000 \
+    > "$tmpfile" 2>&1 &
+  local pid=$!
+
+  local elapsed=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    if [[ $elapsed -ge $timeout_sec ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      rm -f "$tmpfile"
+      echo "TIMEOUT"
+      return
+    fi
+  done
+
+  wait "$pid" 2>/dev/null || true
+  cat "$tmpfile"
+  rm -f "$tmpfile"
+}
 
 # ── Abhängigkeiten prüfen & installieren ─────────────────────
 check_deps() {
@@ -181,7 +211,6 @@ traceroute_check() {
 }
 
 # ── DNS-Check ─────────────────────────────────────────────────
-# FIX v1.1: date +%s%3N funktioniert auf macOS nicht → python3
 dns_check() {
   header "🔎 DNS-Auflösung"
   DOMAINS=("google.com" "github.com" "heise.de")
@@ -205,7 +234,6 @@ dns_check() {
 }
 
 # ── Bandbreite (iperf3) ───────────────────────────────────────
-# FIX v1.1: explizites --connect-timeout + Prozess-Timeout via `timeout`
 bandwidth_check() {
   header "🚀 Bandbreiten-Test (iperf3)"
   warn "Hinweis: Testet TCP-Durchsatz zu öffentlichen iperf3-Servern"
@@ -223,11 +251,11 @@ bandwidth_check() {
 
     echo -e "\n  ${BOLD}→ $NAME ($HOST:$PORT)${RESET}"
 
-    # gtimeout von coreutils falls vorhanden, sonst direkt (macOS hat kein timeout)
-    if command -v gtimeout &>/dev/null; then
-      RESULT=$(gtimeout 20 iperf3 -c "$HOST" -p "$PORT" -t 5 --connect-timeout 5000 2>&1 || true)
-    else
-      RESULT=$(iperf3 -c "$HOST" -p "$PORT" -t 5 --connect-timeout 5000 2>&1 || true)
+    RESULT=$(iperf3_with_timeout "$HOST" "$PORT" 5 20)
+
+    if [[ "$RESULT" == "TIMEOUT" ]]; then
+      fail "Timeout – Server $NAME nicht erreichbar oder zu langsam"
+      continue
     fi
 
     if echo "$RESULT" | grep -q "iperf Done"; then
@@ -243,10 +271,9 @@ bandwidth_check() {
           ok "Retransmits: $RETR  ← sauber"
         fi
       fi
-    elif echo "$RESULT" | grep -q "Connection refused\|unable to connect\|error"; then
-      fail "Server nicht erreichbar ($NAME)"
     else
-      warn "Kein Ergebnis von $NAME – Server möglicherweise überlastet"
+      ERR=$(echo "$RESULT" | grep -i "error\|refused\|failed" | head -1 | sed 's/^[[:space:]]*//')
+      fail "Fehler: ${ERR:-kein Ergebnis von $NAME}"
     fi
   done
 }
@@ -276,7 +303,7 @@ echo "  ██║╚██╗██║██╔══╝     ██║   ██�
 echo "  ██║ ╚████║███████╗   ██║   ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗"
 echo "  ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝"
 echo -e "${RESET}"
-echo -e "  ${CYAN}macOS Netzwerk-Diagnose v1.1${RESET} | $(date '+%Y-%m-%d %H:%M')"
+echo -e "  ${CYAN}macOS Netzwerk-Diagnose v1.2${RESET} | $(date '+%Y-%m-%d %H:%M')"
 echo ""
 
 check_deps
