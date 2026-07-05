@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  netcheck.sh – Netzwerk & WLAN Diagnose für macOS
-#  v1.3 – Server-Update: Paris ersetzt, dritter Server ergänzt
+#  v1.3 – Fallback-Serverliste, robuste iperf3-Logik
 #  Autor: github.com/Onslaught2508/netcheck
 #  Lizenz: MIT
 # ============================================================
@@ -19,14 +19,16 @@ warn()   { echo -e "  ${YELLOW}⚠${RESET}  $1"; }
 fail()   { echo -e "  ${RED}✘${RESET}  $1"; }
 info()   { echo -e "  ${CYAN}ℹ${RESET}  $1"; }
 
+# macOS: date kennt kein %3N → python3
 now_ms() { python3 -c "import time; print(int(time.time() * 1000))"; }
 
+# iperf3 mit hartem Timeout via Background-Job
 iperf3_with_timeout() {
-  local host="$1" port="$2" duration="${3:-5}" timeout_sec="${4:-20}"
+  local host="$1" port="$2" duration="${3:-5}" timeout_sec="${4:-15}"
   local tmpfile
   tmpfile=$(mktemp /tmp/iperf3_XXXXXX)
 
-  iperf3 -c "$host" -p "$port" -t "$duration" --connect-timeout 5000 \
+  iperf3 -c "$host" -p "$port" -t "$duration" --connect-timeout 4000 \
     > "$tmpfile" 2>&1 &
   local pid=$!
 
@@ -223,12 +225,19 @@ dns_check() {
 bandwidth_check() {
   header "🚀 Bandbreiten-Test (iperf3)"
   warn "Hinweis: Testet TCP-Durchsatz zu öffentlichen iperf3-Servern"
+  warn "Strategie: Fallback-Liste – erster erreichbarer Server gewinnt"
 
-  # v1.3: Paris entfernt (offline), zwei zuverlässige Server
+  # Quellen: iperf3serverlist.net (≥90% Uptime, Europa, überwacht)
+  # Format: "HOST:PORT:NAME"
   SERVERS=(
     "speedtest.serverius.net:5002:Niederlande (Serverius)"
-    "iperf.he.net:5201:USA/Fremont (Hurricane Electric)"
+    "speedtest.ams1.novogara.net:5201:Amsterdam (Novogara)"
+    "iperf.online.net:5209:Paris (Online.net)"
+    "bouygues.testdebit.info:5209:Paris (Bouygues)"
+    "iperf.he.net:5201:Fremont/USA (Hurricane Electric)"
   )
+
+  local success=0
 
   for entry in "${SERVERS[@]}"; do
     HOST="${entry%%:*}"
@@ -238,10 +247,10 @@ bandwidth_check() {
 
     echo -e "\n  ${BOLD}→ $NAME ($HOST:$PORT)${RESET}"
 
-    RESULT=$(iperf3_with_timeout "$HOST" "$PORT" 5 20)
+    RESULT=$(iperf3_with_timeout "$HOST" "$PORT" 5 15)
 
     if [[ "$RESULT" == "TIMEOUT" ]]; then
-      fail "Timeout – Server nicht erreichbar (>20s)"
+      fail "Timeout – übersprungen"
       continue
     fi
 
@@ -258,11 +267,20 @@ bandwidth_check() {
           ok "Retransmits: $RETR  ← sauber"
         fi
       fi
+      success=1
+      break   # ← Erster Erfolg reicht, Rest überspringen
     else
       ERR=$(echo "$RESULT" | grep -i "error\|refused\|failed" | head -1 | sed 's/^[[:space:]]*//')
-      fail "Fehler: ${ERR:-kein Ergebnis}"
+      fail "Fehler: ${ERR:-kein Ergebnis} – übersprungen"
     fi
   done
+
+  if [[ $success -eq 0 ]]; then
+    echo ""
+    warn "Alle iperf3-Server nicht erreichbar."
+    info "Mögliche Ursachen: Firewall, Sonntagabend-Last, temporäre Ausfälle."
+    info "Bandbreite alternativ testen: https://fast.com oder https://speedtest.net"
+  fi
 }
 
 summary() {
